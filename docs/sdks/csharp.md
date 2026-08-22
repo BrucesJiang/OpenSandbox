@@ -369,6 +369,8 @@ await sandbox.Files.DeleteDirectoriesAsync(new[] { "/tmp/demo" });
 
 For binary data, use `byte[]` or `Stream` in `WriteEntry.Data`, and download with `ReadBytesAsync()` or `ReadBytesStreamAsync()`. Read options support partial downloads.
 
+Use `ReadBytesDetailedAsync` or `ReadBytesStreamDetailedAsync` when Range response metadata is required. Dispose a detailed stream body if it is not fully consumed.
+
 #### File operations with an explicit identity
 
 Bind a filesystem client to a Linux UID and GID:

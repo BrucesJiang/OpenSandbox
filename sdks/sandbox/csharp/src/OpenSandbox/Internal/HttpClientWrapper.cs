@@ -599,7 +599,7 @@ internal sealed class HttpClientWrapper
     /// connection request timeout.
     /// </para>
     /// </summary>
-    private async Task<HttpResponseMessage> SendWithWakeRetryAsync(
+    internal async Task<HttpResponseMessage> SendWithWakeRetryAsync(
         Func<HttpRequestMessage> requestFactory,
         CancellationToken cancellationToken,
         Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>>? sender = null)
@@ -724,7 +724,7 @@ internal sealed class HttpClientWrapper
         }
     }
 
-    private async Task EnsureSuccessAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    internal async Task EnsureSuccessAsync(HttpResponseMessage response, CancellationToken cancellationToken)
     {
         if (!response.IsSuccessStatusCode)
         {
