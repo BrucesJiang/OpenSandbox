@@ -391,6 +391,8 @@ files.forEach(f -> System.out.println("Found: " + f.getPath()));
 sandbox.files().deleteFiles(List.of("/tmp/hello.txt"));
 ```
 
+Use `readByteArrayDetailed` or `readStreamDetailed` when Range response metadata is required.
+
 #### File operations with an explicit identity
 
 Bind a filesystem client to a Linux UID and GID:
