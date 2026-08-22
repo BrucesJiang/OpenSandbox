@@ -341,6 +341,8 @@ await sandbox.files.deleteDirectories(["/tmp/demo"]);
 
 For binary files, pass a `Uint8Array` to `writeFiles()` and read with `readBytes()` or `readBytesStream()`. Read options support `offset` and `limit` for partial downloads.
 
+Use `readBytesDetailed` or `readBytesStreamDetailed` when Range response metadata is required. Close a detailed stream body if it is not fully consumed.
+
 #### File operations with an explicit identity
 
 Bind a filesystem client to a Linux UID and GID:
