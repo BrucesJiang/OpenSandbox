@@ -428,6 +428,8 @@ async with aclosing(await sandbox.files.read_bytes_stream("/tmp/large.bin")) as 
             break
 ```
 
+Use `read_bytes_detailed` or `read_bytes_stream_detailed` when Range response metadata is required. Close a detailed stream body if it is not fully consumed.
+
 #### File operations with an explicit identity
 
 Bind a filesystem client to a Linux UID and GID:
