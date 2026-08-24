@@ -83,6 +83,20 @@ test("readBytesDetailed identifies an ignored Range request", async () => {
   assert.equal(response.totalSize, 10);
 });
 
+test("readBytesDetailed identifies a partial response without Content-Range", async () => {
+  const adapter = createAdapter(async () =>
+    new Response("hello", {
+      status: 206,
+    }),
+  );
+
+  const response = await adapter.readBytesDetailed("/data.bin");
+
+  assert.equal(response.isPartial, true);
+  assert.equal(response.contentRange, undefined);
+  assert.equal(response.totalSize, -1);
+});
+
 test("readBytesDetailed preserves malformed and unknown Content-Range values", async () => {
   const ranges = ["garbage", "bytes 5-9/*"];
   const adapter = createAdapter(async () =>

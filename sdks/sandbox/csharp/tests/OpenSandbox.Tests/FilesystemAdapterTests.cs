@@ -16,6 +16,7 @@ using System.Net;
 using System.Text;
 using FluentAssertions;
 using OpenSandbox.Adapters;
+using OpenSandbox.Core;
 using OpenSandbox.Internal;
 using OpenSandbox.Models;
 using Xunit;
@@ -205,6 +206,21 @@ public class FilesystemAdapterTests
     }
 
     [Fact]
+    public async Task ReadBytesDetailedAsync_ShouldIdentifyPartialResponseWithoutContentRange()
+    {
+        var handler = new DownloadHandler();
+        handler.Enqueue(DownloadResponse(HttpStatusCode.PartialContent, "hello"));
+        using var client = new HttpClient(handler);
+        var adapter = CreateAdapter(client);
+
+        var response = await adapter.ReadBytesDetailedAsync("/data.bin");
+
+        response.IsPartial.Should().BeTrue();
+        response.ContentRange.Should().BeNull();
+        response.TotalSize.Should().Be(-1);
+    }
+
+    [Fact]
     public async Task ReadBytesDetailedAsync_ShouldPreserveInvalidAndUnknownRanges()
     {
         var handler = new DownloadHandler();
@@ -260,6 +276,31 @@ public class FilesystemAdapterTests
             break;
         }
         partialContent.Disposed.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task ReadBytesStreamDetailedAsync_ShouldUseStandardApiErrorMapping()
+    {
+        var errorContent = new TrackingContent(
+            """{"error":{"code":"FILE_NOT_FOUND","message":"missing file"}}""");
+        var errorResponse = new HttpResponseMessage(HttpStatusCode.NotFound)
+        {
+            Content = errorContent,
+        };
+        errorResponse.Headers.TryAddWithoutValidation(Constants.RequestIdHeader, "request-123");
+        var handler = new DownloadHandler();
+        handler.Enqueue(errorResponse);
+        using var client = new HttpClient(handler);
+        var adapter = CreateAdapter(client);
+
+        var action = () => adapter.ReadBytesStreamDetailedAsync("/missing.bin");
+
+        var exception = await action.Should().ThrowAsync<SandboxApiException>();
+        exception.Which.StatusCode.Should().Be(404);
+        exception.Which.RequestId.Should().Be("request-123");
+        exception.Which.Error.Code.Should().Be("FILE_NOT_FOUND");
+        exception.Which.Error.Message.Should().Be("missing file");
+        errorContent.Disposed.Should().BeTrue();
     }
 
     private static FilesystemAdapter CreateAdapter(HttpClient client)

@@ -1897,6 +1897,23 @@ func TestDownloadFileResponse_Range(t *testing.T) {
 	require.Equal(t, ByteRange{Start: 0, End: 4, Total: 10, Raw: "bytes 0-4/10"}, *resp.ContentRange)
 }
 
+func TestDownloadFileResponse_PartialWithoutContentRange(t *testing.T) {
+	_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("hello"))
+	})
+
+	resp, err := client.DownloadFileResponse(context.Background(), "/sandbox/big.bin", "bytes=0-4")
+	require.NoErrorf(t, err, "DownloadFileResponse partial without Content-Range")
+	defer resp.Body.Close()
+
+	require.Equal(t, true, resp.IsPartial())
+	if resp.ContentRange != nil {
+		assert.Fail(t, fmt.Sprintf("ContentRange = %+v, want nil", resp.ContentRange))
+	}
+	require.Equal(t, int64(-1), resp.TotalSize)
+}
+
 func TestDownloadFileResponse_InvalidContentRange(t *testing.T) {
 	_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Range", "garbage")

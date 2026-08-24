@@ -214,6 +214,21 @@ class FilesystemAdapterTest {
     }
 
     @Test
+    fun `readByteArrayDetailed identifies a partial response without Content-Range`() {
+        mockWebServer.enqueue(
+            MockResponse()
+                .setResponseCode(206)
+                .setBody("hello"),
+        )
+
+        val response = filesystemAdapter.readByteArrayDetailed("/data.bin")
+
+        assertTrue(response.isPartial)
+        assertNull(response.contentRange)
+        assertEquals(-1, response.totalSize)
+    }
+
+    @Test
     fun `readByteArrayDetailed preserves invalid and unknown Content-Range values`() {
         mockWebServer.enqueue(
             MockResponse()

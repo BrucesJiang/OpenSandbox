@@ -21,7 +21,7 @@ Uses auto-generated isolated_execution API modules with explicit session_id.
 
 import json
 import logging
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncIterator
 from io import IOBase, TextIOBase
 from uuid import UUID
 

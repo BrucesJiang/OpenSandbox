@@ -101,6 +101,24 @@ async def test_async_read_bytes_detailed_identifies_ignored_and_invalid_ranges()
     await adapter._httpx_client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_async_read_bytes_detailed_identifies_partial_without_range() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(206, request=request, content=b"hello")
+
+    adapter = FilesystemAdapter(
+        ConnectionConfig(protocol="http", transport=httpx.MockTransport(handler)),
+        _endpoint(),
+    )
+
+    response = await adapter.read_bytes_detailed("/data.bin")
+
+    assert response.is_partial is True
+    assert response.content_range is None
+    assert response.total_size == -1
+    await adapter._httpx_client.aclose()
+
+
 class _TrackingAsyncStream(httpx.AsyncByteStream):
     def __init__(self) -> None:
         self.closed = False
