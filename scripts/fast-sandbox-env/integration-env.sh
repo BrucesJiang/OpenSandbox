@@ -1192,7 +1192,8 @@ PY
 	[[ -n "$MITM_ECHO_IP" ]] || die "could not resolve the echo container IP on network $net"
 	wait_for "TLS echo endpoint answering on $MITM_ECHO_IP:$MITM_ECHO_PORT" 30 mitm_echo_ready
 	probe="$(mitm_echo_headers 'X-Mitm-Echo-Probe: env-up')"
-	[[ "$probe" == *'"x-mitm-echo-probe":"env-up"'* ]] \
+	# Whitespace-tolerant: the body is python json.dumps output (": " separators).
+	printf '%s' "$probe" | grep -Eq '"x-mitm-echo-probe":[[:space:]]*"env-up"' \
 		|| die "echo endpoint did not reflect headers: $probe"
 	pass "TLS echo endpoint up ($MITM_ECHO_DOMAIN @ $MITM_ECHO_IP:$MITM_ECHO_PORT, cert signed by the pinned CA)"
 }
