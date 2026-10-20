@@ -23,7 +23,13 @@
 # store, and the firecracker-egress-pool SandboxPool with the OpenSandbox
 # egress sidecar — then verifies end to end: sandbox create via the
 # opensandbox CLI, execd /ping through the signed gateway route, delete,
-# a pause/resume round trip, and a snapshot -> restore-from-snapshotId boot.
+# a pause/resume round trip, a snapshot -> restore-from-snapshotId boot,
+# the egress-held credential vault lifecycle (OSEP-0022 FastPath relay), and
+# the full MITM CA chain (OSEP-0022 trust anchor): a self-signed CA is
+# provisioned as the versioned Secret, the server bakes it into the golden
+# image, the pool pins the keypair into mitmdump, and a guest HTTPS request
+# proves the template↔pool fingerprint pinning plus per-subject credential
+# injection against a CA-signed TLS echo endpoint.
 #
 # All Kubernetes resources come from the charts via `helm template` + plain
 # `kubectl apply` (no helm release state); the only env-owned manifests are
@@ -143,6 +149,25 @@ IMG_JANITOR="${IMAGE_JANITOR:-opensandbox/fsb-janitor:dev}"
 IMG_BUILDER="${IMAGE_BUILDER:-opensandbox/fsb-sandboxtemplate-builder:dev}"
 IMG_RUNTIME="${IMAGE_RUNTIME:-opensandbox/fsb-firecracker-runtime:dev}"
 IMG_EGRESS="${EGRESS_IMAGE:-docker.io/opensandbox/egress:latest}"
+
+# OSEP-0022 MITM trust anchor — always on in this environment: a self-signed
+# CA is provisioned as the versioned Secret (ops-runbook shape), the server
+# bakes it into the golden-image template, the egress seeds it into mitmdump,
+# and a dedicated verify stage proves the whole chain (fingerprint pinning +
+# per-subject credential injection over guest HTTPS). A broken chain fails
+# closed and observably (MITM addon down on /healthz, template bake, pinning
+# check) instead of silently degrading.
+MITM_CA_SECRET="${MITM_CA_SECRET:-opensandbox-mitm-ca-v1}"
+MITM_CA_DIR="$WORK/mitm-ca"
+MITM_CA_FINGERPRINT_FILE="$MITM_CA_DIR/fingerprint"
+MITM_CA_FINGERPRINT=""
+# TLS echo endpoint (certificate signed by the pinned CA) as a container on
+# the kind network (same shape as RustFS): the guest reaches it by IP, the
+# vault binding matches by SNI.
+MITM_ECHO_CONTAINER="${MITM_ECHO_CONTAINER:-fast-sandbox-env-mitm-echo}"
+MITM_ECHO_DOMAIN="${MITM_ECHO_DOMAIN:-echo.test}"
+MITM_ECHO_PORT=443
+MITM_ECHO_IP=""
 
 image_repo() { printf '%s' "${1%:*}"; }
 image_tag() { printf '%s' "${1##*:}"; }
@@ -313,7 +338,7 @@ failure_dump() {
 	mkdir -p "$LOGS_DIR"
 	{
 		echo "=== fast-sandbox-env failure: $task ($(date -u +%FT%TZ)) ==="
-		env | grep -E '^(KIND_(CLUSTER|SINGLE|RETAIN|NODE_IMAGE)=|FSB_DIR=|SBX_IMAGE=|IMG_[A-Z_]+=|EGRESS_IMAGE=|EXECD=|WORK=|POOL_(NAME|MIN|MAX)=|INGRESS_IMAGE=|WARM_IMAGES=|XFS_(STATEROOT|SIZE)=|RUSTFS_(IMAGE|PORT|CONSOLE_PORT|BUCKET|CONTAINER|DATA|ENDPOINT)=|RC_IMAGE=)' || true
+		env | grep -E '^(KIND_(CLUSTER|SINGLE|RETAIN|NODE_IMAGE)=|FSB_DIR=|SBX_IMAGE=|IMG_[A-Z_]+=|EGRESS_IMAGE=|EXECD=|WORK=|POOL_(NAME|MIN|MAX)=|INGRESS_IMAGE=|WARM_IMAGES=|XFS_(STATEROOT|SIZE)=|RUSTFS_(IMAGE|PORT|CONSOLE_PORT|BUCKET|CONTAINER|DATA|ENDPOINT)=|RC_IMAGE=|MITM_(CA_SECRET|CA_DIR|ECHO_CONTAINER|ECHO_DOMAIN)=)' || true
 		echo "--- fast-sandbox checkout ---"
 		git -C "$FSB_DIR" rev-parse HEAD 2>&1 || true
 		echo "--- kind-create.log (tail) ---"
@@ -363,6 +388,48 @@ failure_dump() {
 			kubectl -n "$RESOURCE_NS" exec "$pod" -c egress -- \
 				ls -la /var/lib/fast-sandbox/firecracker/snapshots 2>&1 | tail -8 || true
 		done
+		# MITM CA chain (OSEP-0022) failure scene: the addon-down reason
+		# lives on /healthz; seed/confdir visibility separates "Secret never
+		# mounted" from "mitmdump failed to start". The echo container and
+		# the guest curl stderr are only capturable here (down deletes both).
+		echo "--- MITM CA chain diagnostics ---"
+		if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$MITM_ECHO_CONTAINER"; then
+			echo "-- echo container --"
+			docker ps -a --filter "name=$MITM_ECHO_CONTAINER" --format '{{.Names}} {{.Status}}' 2>&1 || true
+			docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}={{$v.IPAddress}} {{end}}' "$MITM_ECHO_CONTAINER" 2>&1 || true
+			docker logs "$MITM_ECHO_CONTAINER" --tail=50 2>&1 || true
+		fi
+		if [[ -d "$MITM_CA_DIR" ]]; then
+			echo "-- pinned CA material (names + fingerprint only, never key bytes) --"
+			ls -l "$MITM_CA_DIR" 2>&1 || true
+			echo "pinned fingerprint: $(cat "$MITM_CA_FINGERPRINT_FILE" 2>/dev/null || echo missing)"
+		fi
+		if [[ -f "$LOGS_DIR/mitm-guest-curl.err" ]]; then
+			echo "-- last guest curl stderr ($LOGS_DIR/mitm-guest-curl.err) --"
+			tail -20 "$LOGS_DIR/mitm-guest-curl.err" 2>&1 || true
+		fi
+		local mitm_pod
+		mitm_pod="$(first_pool_pod 2>/dev/null || true)"
+		if [[ -n "$mitm_pod" ]]; then
+			echo "-- egress MITM surfaces (pod ${mitm_pod##*/}) --"
+			kubectl -n "$RESOURCE_NS" exec "pod/$mitm_pod" -c egress -- \
+				curl -fsS -m 5 "http://127.0.0.1:18080/healthz" 2>&1 || true
+			echo
+			kubectl -n "$RESOURCE_NS" exec "pod/$mitm_pod" -c egress -- \
+				curl -fsS -m 5 "http://127.0.0.1:18080/_fastlet/v1/actions/status" 2>&1 || true
+			echo
+			echo "-- egress seed mount + mitmdump confdir visibility --"
+			kubectl -n "$RESOURCE_NS" exec "pod/$mitm_pod" -c egress -- \
+				ls -la /var/egress/mitm-ca-seed 2>&1 || true
+			kubectl -n "$RESOURCE_NS" exec "pod/$mitm_pod" -c egress -- \
+				ls -la /var/lib/mitmproxy/.mitmproxy 2>&1 || true
+			kubectl -n "$RESOURCE_NS" exec "pod/$mitm_pod" -c egress -- \
+				pgrep -af mitmdump 2>&1 || true
+		fi
+		if [[ -f "$GEN_DIR/mitm-ca-policy.json" ]]; then
+			echo "-- mitm-ca verify sandbox policy --"
+			cat "$GEN_DIR/mitm-ca-policy.json" 2>&1 || true
+		fi
 		echo "--- recent events ($RESOURCE_NS) ---"
 		kubectl get events -n "$RESOURCE_NS" --sort-by=.lastTimestamp 2>&1 | tail -30 || true
 		echo "--- OpenSandbox pods ($OSB_NS) ---"
@@ -479,6 +546,7 @@ preflight() {
 		|| die "this environment requires a Linux host with KVM (run it on the remote development VM)"
 	command -v docker >/dev/null || die "docker is required"
 	command -v go >/dev/null || die "go is required (>=1.25, used by make images and gen-registry)"
+	command -v openssl >/dev/null || die "openssl is required (signing key + pinned MITM CA generation)"
 	ensure_tool kind
 	ensure_tool kubectl
 	ensure_tool helm
@@ -929,6 +997,161 @@ credentials_up() {
 	pass "credentials written (publish/pull)"
 }
 
+# --- stage: MITM CA material (OSEP-0022 trust anchor) -------------------------
+
+# mitm_ca_fingerprint <cert.pem> -> lowercase hex SHA-256 over the DER — the
+# exact fingerprint form the egress /healthz and the template manifest
+# lineage expose.
+mitm_ca_fingerprint() {
+	openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//' | tr -d ':' | tr 'A-Z' 'a-z'
+}
+
+load_mitm_ca_fingerprint() {
+	if [[ -z "$MITM_CA_FINGERPRINT" && -s "$MITM_CA_FINGERPRINT_FILE" ]]; then
+		MITM_CA_FINGERPRINT="$(cat "$MITM_CA_FINGERPRINT_FILE")"
+	fi
+}
+
+mitm_ca_up() {
+	local stored_fp
+	mkdir -p "$MITM_CA_DIR"
+	# Fresh material every run: the env owns no CA state worth carrying
+	# across runs (the template that bakes it is rebuilt each time anyway);
+	# down() removes the directory so a stale CA can never resurface.
+	rm -f "$MITM_CA_DIR"/tls.crt "$MITM_CA_DIR"/tls.key "$MITM_CA_DIR"/tls.srl \
+		"$MITM_CA_DIR"/echo.crt "$MITM_CA_DIR"/echo.key "$MITM_CA_DIR"/echo.csr "$MITM_CA_DIR"/echo.ext \
+		"$MITM_CA_FINGERPRINT_FILE"
+	# Versioned, immutable-by-convention CA (the v1 of opensandbox-mitm-ca-*):
+	# a real signing CA (keyCertSign), what the egress seed validator demands.
+	openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+		-keyout "$MITM_CA_DIR/tls.key" -out "$MITM_CA_DIR/tls.crt" \
+		-subj "/CN=$MITM_CA_SECRET" \
+		-addext "basicConstraints=critical,CA:TRUE" \
+		-addext "keyUsage=critical,keyCertSign,cRLSign" >/dev/null 2>&1 \
+		|| die "pinned MITM CA generation failed (openssl)"
+	MITM_CA_FINGERPRINT="$(mitm_ca_fingerprint "$MITM_CA_DIR/tls.crt")"
+	[[ "$MITM_CA_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] \
+		|| die "generated MITM CA fingerprint is malformed: $MITM_CA_FINGERPRINT"
+	printf '%s' "$MITM_CA_FINGERPRINT" > "$MITM_CA_FINGERPRINT_FILE"
+	# Leaf certificate for the TLS echo endpoint, signed by the pinned CA —
+	# both trust legs of the chain test terminate at it (the guest trusts it
+	# through the MITM-signed certificate, mitmdump trusts it upstream).
+	openssl req -new -newkey rsa:2048 -nodes \
+		-keyout "$MITM_CA_DIR/echo.key" -out "$MITM_CA_DIR/echo.csr" \
+		-subj "/CN=$MITM_ECHO_DOMAIN" >/dev/null 2>&1 \
+		|| die "echo certificate request generation failed"
+	printf 'subjectAltName=DNS:%s\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' \
+		"$MITM_ECHO_DOMAIN" > "$MITM_CA_DIR/echo.ext"
+	openssl x509 -req -in "$MITM_CA_DIR/echo.csr" \
+		-CA "$MITM_CA_DIR/tls.crt" -CAkey "$MITM_CA_DIR/tls.key" -CAcreateserial \
+		-out "$MITM_CA_DIR/echo.crt" -days 2 -extfile "$MITM_CA_DIR/echo.ext" >/dev/null 2>&1 \
+		|| die "echo certificate signing failed"
+	openssl verify -CAfile "$MITM_CA_DIR/tls.crt" "$MITM_CA_DIR/echo.crt" >/dev/null 2>&1 \
+		|| die "echo certificate does not verify against the pinned CA"
+	# Ops-runbook distribution, collapsed into one namespace here (the pool
+	# and template-build namespaces coincide): the keypair entries feed the
+	# egress seed mount, the certificate-only entry (ca.crt) feeds the server
+	# template bake. A real deployment keeps the certificate-only copy in the
+	# template namespace and never carries the key.
+	kubectl -n "$RESOURCE_NS" create secret generic "$MITM_CA_SECRET" \
+		--from-file=tls.crt="$MITM_CA_DIR/tls.crt" \
+		--from-file=tls.key="$MITM_CA_DIR/tls.key" \
+		--from-file=ca.crt="$MITM_CA_DIR/tls.crt" \
+		--dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	# Content, not name: the stored certificate must fingerprint identically
+	# (the same-named-copy-wrong-content drift the design calls out).
+	stored_fp="$(kubectl -n "$RESOURCE_NS" get secret "$MITM_CA_SECRET" \
+		-o jsonpath='{.data.tls\.crt}' | base64 -d | mitm_ca_fingerprint /dev/stdin)"
+	[[ "$stored_fp" == "$MITM_CA_FINGERPRINT" ]] \
+		|| die "Secret $MITM_CA_SECRET certificate fingerprint mismatch: stored=$stored_fp pinned=$MITM_CA_FINGERPRINT"
+	pass "pinned MITM CA provisioned ($MITM_CA_SECRET, fingerprint ${MITM_CA_FINGERPRINT:0:16}…)"
+}
+
+# --- stage: TLS echo endpoint (certificate signed by the pinned CA) -----------
+
+# The echo reflects the request headers it observed as the response body —
+# the injected credential header must appear there, which is the per-subject
+# injection assertion. Runs as a plain container on the kind network (same
+# shape as RustFS): reuses the locally built egress image (python3) so no
+# new image dependency is introduced.
+mitm_echo_up() {
+	local net script probe
+	net="$(kind_network)"
+	mkdir -p "$GEN_DIR"
+	script="$GEN_DIR/mitm-echo-server.py"
+	cat > "$script" <<'PY'
+import http.server
+import json
+import ssl
+import sys
+
+port, cert, key = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def _echo(self):
+        body = json.dumps({k.lower(): v for k, v in self.headers.items()}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_GET = _echo
+    do_POST = _echo
+
+    def log_message(self, *args):
+        pass
+
+
+httpd = http.server.ThreadingHTTPServer(("0.0.0.0", port), Handler)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(cert, key)
+httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+httpd.serve_forever()
+PY
+	docker rm -f "$MITM_ECHO_CONTAINER" >/dev/null 2>&1 || true
+	# --entrypoint: the egress image's supervisor ENTRYPOINT must not wrap
+	# this process; root (image default) binds :443.
+	docker run -d --name "$MITM_ECHO_CONTAINER" --network "$net" \
+		--entrypoint python3 \
+		-v "$MITM_CA_DIR/echo.crt":/etc/mitm-echo/tls.crt:ro \
+		-v "$MITM_CA_DIR/echo.key":/etc/mitm-echo/tls.key:ro \
+		-v "$script":/srv/mitm-echo-server.py:ro \
+		"$IMG_EGRESS" /srv/mitm-echo-server.py "$MITM_ECHO_PORT" \
+		/etc/mitm-echo/tls.crt /etc/mitm-echo/tls.key >/dev/null \
+		|| die "TLS echo container failed to start"
+	MITM_ECHO_IP="$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$v.IPAddress}}{{end}}' "$MITM_ECHO_CONTAINER")"
+	[[ -n "$MITM_ECHO_IP" ]] || die "could not resolve the echo container IP on network $net"
+	wait_for "TLS echo endpoint answering on $MITM_ECHO_IP:$MITM_ECHO_PORT" 30 mitm_echo_ready
+	probe="$(mitm_echo_headers 'X-Mitm-Echo-Probe: env-up')"
+	[[ "$probe" == *'"x-mitm-echo-probe":"env-up"'* ]] \
+		|| die "echo endpoint did not reflect headers: $probe"
+	pass "TLS echo endpoint up ($MITM_ECHO_DOMAIN @ $MITM_ECHO_IP:$MITM_ECHO_PORT, cert signed by the pinned CA)"
+}
+
+mitm_echo_ready() {
+	[[ -n "$MITM_ECHO_IP" ]] || return 1
+	curl -fsS -m 5 --noproxy '*' --cacert "$MITM_CA_DIR/tls.crt" \
+		--resolve "$MITM_ECHO_DOMAIN:$MITM_ECHO_PORT:$MITM_ECHO_IP" \
+		"https://$MITM_ECHO_DOMAIN:$MITM_ECHO_PORT/echo" >/dev/null 2>&1
+}
+
+# mitm_echo_headers [extra-header] -> reflected request headers (JSON body).
+# Host-side direct probe of the endpoint itself.
+mitm_echo_headers() {
+	local extra="${1:-}"
+	if [[ -n "$extra" ]]; then
+		curl -fsS -m 10 --noproxy '*' --cacert "$MITM_CA_DIR/tls.crt" \
+			--resolve "$MITM_ECHO_DOMAIN:$MITM_ECHO_PORT:$MITM_ECHO_IP" \
+			-H "$extra" "https://$MITM_ECHO_DOMAIN:$MITM_ECHO_PORT/echo" 2>/dev/null
+	else
+		curl -fsS -m 10 --noproxy '*' --cacert "$MITM_CA_DIR/tls.crt" \
+			--resolve "$MITM_ECHO_DOMAIN:$MITM_ECHO_PORT:$MITM_ECHO_IP" \
+			"https://$MITM_ECHO_DOMAIN:$MITM_ECHO_PORT/echo" 2>/dev/null
+	fi
+}
+
 # --- stage: control plane -------------------------------------------------------------------
 
 # helm is only a renderer; the cluster keeps no helm release state, so
@@ -1112,7 +1335,36 @@ template_up() {
 	manifest_ref="$(osb_api template get "$TEMPLATE_ID" -o json | jq -r '.status.manifest_ref // empty')"
 	[[ -n "$manifest_ref" ]] || fail "template manifestRef is empty"
 	log "template manifestRef: $manifest_ref"
+	# OSEP-0022 CA wiring: the server filled spec.egressMitmCertificate from
+	# template_mitm_ca_secret (first real exercise of the server-side fill),
+	# and the builder stamped the baked certificate's fingerprint into the
+	# published manifest lineage.
+	local cert_ref lineage_fp
+	cert_ref="$(kubectl -n "$RESOURCE_NS" get sandboxtemplate "$TEMPLATE_ID" \
+		-o jsonpath='{.spec.egressMitmCertificate.secretRef.name}' 2>/dev/null)"
+	[[ "$cert_ref" == "$MITM_CA_SECRET" ]] \
+		|| fail "template CR carries no egressMitmCertificate secretRef (got '$cert_ref', want $MITM_CA_SECRET)"
+	local cert_key
+	cert_key="$(kubectl -n "$RESOURCE_NS" get sandboxtemplate "$TEMPLATE_ID" \
+		-o jsonpath='{.spec.egressMitmCertificate.key}' 2>/dev/null)"
+	[[ "$cert_key" == "ca.crt" ]] \
+		|| fail "template CR egressMitmCertificate.key is '$cert_key', want ca.crt (certificate entry only)"
+	lineage_fp="$(template_mitm_lineage_fingerprint)"
+	[[ "$lineage_fp" == "$MITM_CA_FINGERPRINT" ]] \
+		|| fail "template manifest lineage egressMitmCA.certSha256 is '${lineage_fp:-empty}', want pinned $MITM_CA_FINGERPRINT"
+	log "template baked CA: secret/$cert_ref (ca.crt), lineage fingerprint ${lineage_fp:0:16}…"
 	pass "SandboxTemplate Succeeded + artifacts published (via opensandbox CLI)"
+}
+
+# template_mitm_lineage_fingerprint -> the egressMitmCA.certSha256 the
+# builder stamped into the published artifact-set manifest (empty when the
+# manifest or the lineage entry is missing).
+template_mitm_lineage_fingerprint() {
+	local manifest_ref manifest_json
+	manifest_ref="$(osb_api template get "$TEMPLATE_ID" -o json 2>/dev/null | jq -r '.status.manifest_ref // empty')"
+	[[ -n "$manifest_ref" ]] || return 0
+	manifest_json="$(rc cat "chain/$RUSTFS_BUCKET/$(dirname "${manifest_ref#s3://$RUSTFS_BUCKET/}")/manifest.json" 2>/dev/null)" || return 0
+	printf '%s' "$manifest_json" | jq -r '.lineage.egressMitmCA.certificates[0].certSha256 // empty' 2>/dev/null
 }
 
 # --- stage: SandboxPool (egress attached, P2P spread) --------------------------------------------
@@ -1183,11 +1435,13 @@ render_pool() { # > $GEN_DIR/firecracker-egress-pool.yaml
 	awk -v fastlet="$IMG_FASTLET" -v egress="$IMG_EGRESS" \
 		-v pool_min="$POOL_MIN" -v pool_max="$POOL_MAX" \
 		-v max_per_pod="$MAX_SANDBOXES_PER_POD" \
-		-v warm="$WARM_IMAGES" -v image="$TEMPLATE_ID" '
+		-v warm="$WARM_IMAGES" -v image="$TEMPLATE_ID" \
+		-v mitm_ca="$MITM_CA_SECRET" '
 		{ gsub(/"@FASTLET_IMAGE@"/, fastlet)
 		  gsub(/"@EGRESS_IMAGE@"/, egress)
 		  gsub(/"@POOL_MIN@"/, pool_min)
 		  gsub(/"@POOL_MAX@"/, pool_max)
+		  gsub(/"@MITM_CA_SECRET@"/, mitm_ca)
 		  gsub(/maxSandboxesPerPod: 5/, "maxSandboxesPerPod: " max_per_pod) }
 		/^# @WARM_IMAGES@$/ {
 			if (warm == "1") printf "  warmImages:\n  - %s\n", image
@@ -1202,14 +1456,17 @@ render_pool() { # > $GEN_DIR/firecracker-egress-pool.yaml
 }
 
 pool_up() {
+	load_mitm_ca_fingerprint
+	[[ -n "$MITM_CA_FINGERPRINT" ]] || die "no pinned MITM CA fingerprint at $MITM_CA_FINGERPRINT_FILE (run up first; mitm_ca_up stores it there)"
 	render_pool
-	log "applying SandboxPool $POOL_NAME (runtime=firecracker, egress attached, poolMin=$POOL_MIN)"
+	log "applying SandboxPool $POOL_NAME (runtime=firecracker, egress attached, MITM CA pinned, poolMin=$POOL_MIN)"
 	kubectl apply -f "$GEN_DIR/firecracker-egress-pool.yaml" >/dev/null
 	wait_for "fastlet pods Ready (poolMin=$POOL_MIN)" 300 fastlet_pods_ready
 	wait_for "egress container ready in every fastlet pod" 180 egress_containers_ready
 	wait_for "pool condition RuntimeReady=True" 120 pool_condition_true RuntimeReady
 	wait_for "pool condition InfraReady=True" 120 pool_condition_true InfraReady
 	wait_for "egress actions endpoint answering (/_fastlet/v1/actions/status)" 60 egress_status_ready
+	wait_for "egress MITM addon up with the pinned CA fingerprint" 120 egress_mitm_ca_pinned
 	if [[ "$WARM_IMAGES" == "1" ]]; then
 		wait_for "pool warmImages Ready" 300 warm_images_ready
 		p2p_evidence "warm preheat"
@@ -1217,6 +1474,27 @@ pool_up() {
 	else
 		pass "fastlet Running, on-demand pull (default: first sandbox pulls through DART)"
 	fi
+}
+
+# egress_mitm_ca_fingerprint -> the pinned CA fingerprint the egress exposes
+# on /healthz (empty while the MITM addon is down/pending or not yet up).
+egress_mitm_ca_fingerprint() {
+	local pod out
+	pod="$(first_pool_pod)"
+	[[ -n "$pod" ]] || return 1
+	out="$(kubectl -n "$RESOURCE_NS" exec "pod/$pod" -c egress -- \
+		curl -fsS -m 5 "http://127.0.0.1:18080/healthz" 2>/dev/null)" || return 1
+	printf '%s' "$out" | sed -n 's/.*"mitmCaFingerprint":"\([0-9a-f]*\)".*/\1/p'
+}
+
+# Content pinning (OSEP-0022): the egress seed's fingerprint must equal the
+# pinned CA's — a same-named Secret copy carrying different (but valid)
+# material fails here loudly instead of degrading into opaque guest TLS
+# failures.
+egress_mitm_ca_pinned() {
+	local fp
+	fp="$(egress_mitm_ca_fingerprint)"
+	[[ -n "$fp" && "$fp" == "$MITM_CA_FINGERPRINT" ]]
 }
 
 # Assert the P2P outcome from DART block counters: the artifact set is
@@ -1301,13 +1579,14 @@ render_server_config() { # > $GEN_DIR/osb-server-config.toml
 	mkdir -p "$GEN_DIR"
 	awk -v api_key="$SERVER_API_KEY" \
 		-v fastpath="$FASTPATH_ENDPOINT" -v fsb_ns="$RESOURCE_NS" -v pool="$POOL_NAME" \
-		-v execd="$EXECD" '
+		-v execd="$EXECD" -v mitm_ca="$MITM_CA_SECRET" '
 		{ gsub(/@SERVER_API_KEY@/, api_key)
 		  gsub(/@SIGNING_KEY@/, signing_key)
 		  gsub(/@FASTPATH_ENDPOINT@/, fastpath)
 		  gsub(/@FSB_NAMESPACE@/, fsb_ns)
 		  gsub(/@POOL_NAME@/, pool)
 		  gsub(/@EXECD_IMAGE@/, execd)
+		  gsub(/@MITM_CA_SECRET@/, mitm_ca)
 		  gsub(/@GATEWAY_ADDRESS@/, gateway)
 		  print }
 	' <<'TOML' > "$GEN_DIR/osb-server-config.toml"
@@ -1331,6 +1610,12 @@ fastpath_endpoint = "@FASTPATH_ENDPOINT@"
 fastpath_resource_pool = "@POOL_NAME@"
 fastpath_wait_ready_seconds = 30.0
 template_s3_publish_secret = "sandbox-oss-credentials"
+# OSEP-0022 MITM trust anchor: server-created SandboxTemplates bake
+# spec.egressMitmCertificate from the pinned CA Secret (certificate entry
+# only, never the private key), so the builder installs it into the guest
+# trust store at build time.
+template_mitm_ca_secret = "@MITM_CA_SECRET@"
+template_mitm_ca_secret_key = "ca.crt"
 TOML
 	if [[ "$IDLE_PAUSE" == "1" ]]; then
 		# Dotted keys nest the redis sub-table.
@@ -1785,6 +2070,122 @@ vault_lifecycle_verify() {
 	wait_for "vault sandbox deleted" 120 verify_sandbox_gone
 }
 
+# --- stage: MITM CA chain verify (OSEP-0022: baked CA + injection + pinning) ----
+
+# Guest-side HTTPS request to the echo endpoint via `osb command run` (the
+# only sandbox-reachable surface). `curl --resolve` pins the SNI to the echo
+# domain — the domain is deliberately unresolvable DNS, and the policy
+# carries the IP-allow rule the resolved flow needs; the egress DNATs the
+# allowed flow to the shared mitmdump, which matches the vault binding by
+# SNI. TLS verification runs against the template-baked CA (no -k anywhere).
+# The guest-side stderr (curl/CLI error text — the first diagnostic for a
+# broken TLS chain) is kept per attempt at $LOGS_DIR/mitm-guest-curl.err for
+# the failure dump.
+mitm_ca_guest_echo() {
+	osb_api command run "$VERIFY_ID" -- \
+		"curl -fsS -m 20 --resolve $MITM_ECHO_DOMAIN:$MITM_ECHO_PORT:$MITM_ECHO_IP https://$MITM_ECHO_DOMAIN:$MITM_ECHO_PORT/echo" \
+		2>"$LOGS_DIR/mitm-guest-curl.err"
+}
+
+# osb_command_succeeds <command>: wait_for probe variant — the guest command
+# must exit 0 (a failed execd command makes the CLI exit non-zero). stderr
+# lands in the same per-attempt diagnostics file as mitm_ca_guest_echo.
+osb_command_succeeds() {
+	osb_api command run "$VERIFY_ID" -- "$1" >/dev/null 2>"$LOGS_DIR/mitm-guest-curl.err"
+}
+
+# mitm_ca_guest_header_is <key> <value>: the echo reflected the exact header.
+# Scans line-by-line: the CLI stream may carry non-JSON framing.
+mitm_ca_guest_header_is() { # <lowercase-key> <expected-value>
+	local out line
+	out="$(mitm_ca_guest_echo)" || return 1
+	while IFS= read -r line; do
+		[[ -n "$line" ]] || continue
+		printf '%s' "$line" | jq -e --arg k "$1" --arg v "$2" '.[$k] == $v' >/dev/null 2>&1 && return 0
+	done <<EOF
+$out
+EOF
+	return 1
+}
+
+mitm_ca_chain_verify() {
+	local created sandbox_uid ack echo_secret
+	log "verify (mitm-ca): three-way fingerprint pinning (template lineage == egress /healthz == pinned Secret)"
+	local healthz_fp lineage_fp
+	healthz_fp="$(egress_mitm_ca_fingerprint)"
+	[[ "$healthz_fp" == "$MITM_CA_FINGERPRINT" ]] \
+		|| fail "mitm-ca verify: egress /healthz fingerprint is '${healthz_fp:-empty}', want pinned $MITM_CA_FINGERPRINT"
+	lineage_fp="$(template_mitm_lineage_fingerprint)"
+	[[ "$lineage_fp" == "$MITM_CA_FINGERPRINT" ]] \
+		|| fail "mitm-ca verify: template manifest lineage fingerprint is '${lineage_fp:-empty}', want pinned $MITM_CA_FINGERPRINT"
+	pass "template↔pool CA pinning: manifest lineage == egress /healthz == pinned (${MITM_CA_FINGERPRINT:0:16}…)"
+
+	# Sandbox policy: the domain allow covers the vault binding (binding
+	# validation requires the host be policy-allowed), the IP allow covers
+	# the --resolve flow at the nft layer (no DNS query ever happens).
+	jq -n --arg ip "$MITM_ECHO_IP" --arg domain "$MITM_ECHO_DOMAIN" \
+		'{defaultAction: "deny", egress: [{action: "allow", target: $ip}, {action: "allow", target: $domain}]}' \
+		> "$GEN_DIR/mitm-ca-policy.json"
+	log "verify (mitm-ca): creating a sandbox via the opensandbox CLI (templateId=$TEMPLATE_ID, echo=$MITM_ECHO_IP)"
+	created="$(osb_api sandbox create --template "$TEMPLATE_ID" --timeout 1h \
+		--metadata origin=fast-sandbox-env-mitm-ca \
+		--network-policy-file "$GEN_DIR/mitm-ca-policy.json" \
+		--skip-health-check -o json 2>/dev/null)" \
+		|| fail "mitm-ca verify: sandbox create failed"
+	VERIFY_ID="$(printf '%s' "$created" | jq -r '.id')"
+	[[ -n "$VERIFY_ID" && "$VERIFY_ID" != "null" ]] || fail "mitm-ca verify: create response carried no id"
+	wait_for "mitm-ca sandbox Running" 300 sandbox_running
+	sandbox_uid="$(kubectl -n "$RESOURCE_NS" get sandbox "$VERIFY_ID" -o jsonpath='{.metadata.uid}' 2>/dev/null)"
+	[[ -n "$sandbox_uid" ]] || fail "mitm-ca verify: sandbox CR carried no uid"
+	wait_for "mitm-ca subject registered on egress" 120 \
+		vault_log_contains "subject s-$sandbox_uid: data-plane-ready, policy active"
+
+	# Negative control BEFORE the vault exists: the flow is allowed and
+	# passes through the shared mitmdump opaquely (unbound SNI), TLS is
+	# verified end-to-end against the template-baked CA — and no credential
+	# header appears. Proves the header in the positive case comes from the
+	# vault, not from anything ambient.
+	wait_for "pre-vault guest HTTPS reaches the echo (passthrough, baked-CA verified)" 120 \
+		osb_command_succeeds "curl -fsS -m 20 --resolve $MITM_ECHO_DOMAIN:$MITM_ECHO_PORT:$MITM_ECHO_IP https://$MITM_ECHO_DOMAIN:$MITM_ECHO_PORT/echo"
+	if mitm_ca_guest_echo | grep -qi 'x-api-key'; then
+		fail "mitm-ca verify: x-api-key present before any vault binding existed"
+	fi
+	pass "pre-vault: guest HTTPS passthrough works, no credential injected"
+
+	# Per-subject vault binding: SNI echo.test -> X-Api-Key.
+	echo_secret="mitm-ca-e2e-$(openssl rand -hex 8)"
+	local vault_body
+	vault_body="$(jq -n --arg v "$echo_secret" --arg domain "$MITM_ECHO_DOMAIN" \
+		'{credentials: [{name: "tok", source: {type: "inline", value: $v}}],
+		  bindings: [{name: "echo", match: {hosts: [$domain]}, auth: {type: "apiKey", name: "X-Api-Key", credential: "tok"}}]}')"
+	ack="$(server_api POST "/sandboxes/$VERIFY_ID/credential-vault" "$vault_body")" \
+		|| fail "mitm-ca verify: POST credential-vault failed"
+	[[ "$(printf '%s' "$ack" | jq -r '.revision // empty')" =~ ^[0-9]+$ ]] \
+		|| fail "mitm-ca verify: vault create ack carried no revision: $(printf '%s' "$ack" | head -c 200)"
+	pass "vault bound to SNI $MITM_ECHO_DOMAIN (X-Api-Key) over the relay"
+
+	wait_for "guest HTTPS reflects the injected X-Api-Key (MITM decrypt + vault by SNI)" 120 \
+		mitm_ca_guest_header_is "x-api-key" "$echo_secret"
+	pass "credential injection observed by the echo endpoint on a guest-originated HTTPS request"
+
+	# Pause/resume: trust travels with the snapshot (the baked CA is part of
+	# the rootfs) and the vault is carried in the bundle — the same request
+	# must keep working end to end after restore.
+	osb_api sandbox pause "$VERIFY_ID" >/dev/null 2>&1 || fail "mitm-ca verify: pause failed"
+	wait_for "mitm-ca sandbox Paused (checkpoint durable)" 240 sandbox_paused
+	osb_api sandbox resume "$VERIFY_ID" --skip-health-check >/dev/null 2>&1 || fail "mitm-ca verify: resume failed"
+	wait_for "mitm-ca sandbox Running (restored)" 240 sandbox_running
+	wait_for "restored subject re-registered on egress" 120 \
+		vault_log_contains "subject s-$sandbox_uid: vault reloaded from file"
+	wait_for "post-resume guest HTTPS still MITM-injected (baked CA + vault survive the snapshot)" 180 \
+		mitm_ca_guest_header_is "x-api-key" "$echo_secret"
+	pass "paused/restored sandbox keeps passing TLS verification against the baked CA (injection intact)"
+
+	osb_api sandbox kill "$VERIFY_ID" >/dev/null 2>&1 \
+		|| log "verify cleanup: kill failed; remove $VERIFY_ID manually"
+	wait_for "mitm-ca sandbox deleted" 120 verify_sandbox_gone
+}
+
 
 
 # --- stage: idle-pause / wake-on-access verify (OSEP-0024 profile) --------------
@@ -2202,6 +2603,7 @@ env_summary() {
 	printf '  %-22s %s\n' "fast-sandbox" "pinned $(git -C "$FSB_DIR" rev-parse --short HEAD 2>/dev/null || echo "$FSB_COMMIT") ($FSB_DIR)"
 	printf '  %-22s %s\n' "RustFS endpoint" "$RUSTFS_ENDPOINT"
 	printf '  %-22s %s\n' "pool" "$POOL_NAME (runtime=firecracker, poolMin=$POOL_MIN, egress=$IMG_EGRESS)"
+	printf '  %-22s %s\n' "MITM CA" "$MITM_CA_SECRET (fingerprint ${MITM_CA_FINGERPRINT:0:16}…, echo=https://$MITM_ECHO_DOMAIN via $MITM_ECHO_IP:$MITM_ECHO_PORT)"
 	printf '  %-22s %s\n' "P2P" "DART daemons=$(printf '%s' "$(runtime_pods)" | wc -w | tr -d ' ') (on-demand pulls: cache -> peer -> origin)"
 	printf '  %-22s %s\n' "template" "${TEMPLATE_ID:-n/a} ($(if [[ -n "$TEMPLATE_ID" ]]; then _template_phase || echo unknown; else echo "not built"; fi))"
 	printf '  %-22s %s\n' "StateRoot fs" "$(findmnt -no FSTYPE "$XFS_MOUNT_POINT" 2>/dev/null || echo 'plain directory (full copy per sandbox)')"
@@ -2223,6 +2625,12 @@ down() {
 	docker rm -f "$RUSTFS_CONTAINER" >/dev/null 2>&1 || true
 	[[ -z "$(docker ps -a --filter "name=$RUSTFS_CONTAINER" --format '{{.Names}}' || true)" ]] \
 		|| fail "RustFS container still present"
+	# TLS echo endpoint + its CA material die with the run (regenerated fresh
+	# on every up; a stale CA must never resurface).
+	docker rm -f "$MITM_ECHO_CONTAINER" >/dev/null 2>&1 || true
+	[[ -z "$(docker ps -a --filter "name=$MITM_ECHO_CONTAINER" --format '{{.Names}}' || true)" ]] \
+		|| fail "MITM echo container still present"
+	rm -rf "$MITM_CA_DIR"
 	# Server/gateway die with the cluster; only the signing key outlives it.
 	rm -f "$WORK/agent-registry.json" "$SIGNING_KEY_FILE"
 	rm -rf "$GEN_DIR" "$FSB_GEN_DIR"
@@ -2339,14 +2747,17 @@ case "$ACTION" in
 		run_stage "RustFS endpoint (kind network)" resolve_rustfs_endpoint
 		run_stage "CRDs + control plane" control_plane_up
 		run_stage "credentials (publish/pull)" credentials_up
+		run_stage "MITM CA material (OSEP-0022 trust anchor)" mitm_ca_up
 		run_stage "firecracker runtime readiness + DART (P2P)" runtime_up
 		run_stage "idle-pause Redis (OSEP-0024 profile)" redis_up
 		run_stage "OpenSandbox server + ingress gateway" opensandbox_up
+		run_stage "TLS echo endpoint (cert signed by the pinned CA)" mitm_echo_up
 		run_stage "SandboxTemplate build (opensandbox CLI)" template_up
 		run_stage "SandboxPool $POOL_NAME (egress + P2P)" pool_up
 		run_stage "end-to-end verify (CLI create -> gateway -> execd /ping)" opensandbox_verify
 		run_stage "pause/resume verify (CLI -> FastPath checkpoint)" pause_resume_verify
 		run_stage "vault lifecycle verify (CLI -> relay -> egress-held vault)" vault_lifecycle_verify
+		run_stage "MITM CA chain verify (baked CA -> injection -> pinning)" mitm_ca_chain_verify
 		run_stage "idle-pause / wake-on-access verify (OSEP-0024 profile)" idle_pause_verify
 		run_stage "snapshot verify (CLI -> SandboxSnapshot -> restore)" snapshot_verify
 		trap - ERR
