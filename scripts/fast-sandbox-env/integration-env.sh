@@ -1215,6 +1215,7 @@ mitm_echo_curl() {
 		--entrypoint curl \
 		-v "$MITM_CA_DIR/tls.crt":/probe/ca.crt:ro \
 		-e HOME=/tmp \
+		"$IMG_EGRESS" \
 		"${extra[@]}" \
 		-fsS -m 10 --noproxy '*' --cacert /probe/ca.crt \
 		--resolve "$MITM_ECHO_DOMAIN:$MITM_ECHO_PORT:$MITM_ECHO_IP" \
