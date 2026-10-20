@@ -404,6 +404,10 @@ failure_dump() {
 			ls -l "$MITM_CA_DIR" 2>&1 || true
 			echo "pinned fingerprint: $(cat "$MITM_CA_FINGERPRINT_FILE" 2>/dev/null || echo missing)"
 		fi
+		if [[ -f "$LOGS_DIR/mitm-ca-openssl.err" ]]; then
+			echo "-- openssl stderr (last MITM CA stage failure) --"
+			tail -20 "$LOGS_DIR/mitm-ca-openssl.err" 2>&1 || true
+		fi
 		if [[ -f "$LOGS_DIR/mitm-guest-curl.err" ]]; then
 			echo "-- last guest curl stderr ($LOGS_DIR/mitm-guest-curl.err) --"
 			tail -20 "$LOGS_DIR/mitm-guest-curl.err" 2>&1 || true
@@ -1013,8 +1017,13 @@ load_mitm_ca_fingerprint() {
 }
 
 mitm_ca_up() {
-	local stored_fp
+	local stored_fp openssl_err
+	openssl_err="$LOGS_DIR/mitm-ca-openssl.err"
 	mkdir -p "$MITM_CA_DIR"
+	# Toolchain evidence: the chain guard depends on the host openssl, so a
+	# failure must always carry the version + stderr (never swallowed).
+	openssl version >> "$LOGS_DIR/environment.txt" 2>&1 || true
+	log "openssl: $(command -v openssl) ($(openssl version 2>&1))"
 	# Fresh material every run: the env owns no CA state worth carrying
 	# across runs (the template that bakes it is rebuilt each time anyway);
 	# down() removes the directory so a stale CA can never resurface.
@@ -1023,12 +1032,15 @@ mitm_ca_up() {
 		"$MITM_CA_FINGERPRINT_FILE"
 	# Versioned, immutable-by-convention CA (the v1 of opensandbox-mitm-ca-*):
 	# a real signing CA (keyCertSign), what the egress seed validator demands.
-	openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+	# Every openssl call captures stderr into $openssl_err so a failure
+	# carries the toolchain's own diagnosis, not just our message.
+	if ! openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
 		-keyout "$MITM_CA_DIR/tls.key" -out "$MITM_CA_DIR/tls.crt" \
 		-subj "/CN=$MITM_CA_SECRET" \
 		-addext "basicConstraints=critical,CA:TRUE" \
-		-addext "keyUsage=critical,keyCertSign,cRLSign" >/dev/null 2>&1 \
-		|| die "pinned MITM CA generation failed (openssl)"
+		-addext "keyUsage=critical,keyCertSign,cRLSign" 2>"$openssl_err"; then
+		die "pinned MITM CA generation failed (openssl $(openssl version 2>&1)): $(tail -3 "$openssl_err" 2>/dev/null | tr '\n' ' ')"
+	fi
 	MITM_CA_FINGERPRINT="$(mitm_ca_fingerprint "$MITM_CA_DIR/tls.crt")"
 	[[ "$MITM_CA_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] \
 		|| die "generated MITM CA fingerprint is malformed: $MITM_CA_FINGERPRINT"
@@ -1036,18 +1048,21 @@ mitm_ca_up() {
 	# Leaf certificate for the TLS echo endpoint, signed by the pinned CA —
 	# both trust legs of the chain test terminate at it (the guest trusts it
 	# through the MITM-signed certificate, mitmdump trusts it upstream).
-	openssl req -new -newkey rsa:2048 -nodes \
+	if ! openssl req -new -newkey rsa:2048 -nodes \
 		-keyout "$MITM_CA_DIR/echo.key" -out "$MITM_CA_DIR/echo.csr" \
-		-subj "/CN=$MITM_ECHO_DOMAIN" >/dev/null 2>&1 \
-		|| die "echo certificate request generation failed"
+		-subj "/CN=$MITM_ECHO_DOMAIN" 2>>"$openssl_err"; then
+		die "echo certificate request generation failed: $(tail -3 "$openssl_err" 2>/dev/null | tr '\n' ' ')"
+	fi
 	printf 'subjectAltName=DNS:%s\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' \
 		"$MITM_ECHO_DOMAIN" > "$MITM_CA_DIR/echo.ext"
-	openssl x509 -req -in "$MITM_CA_DIR/echo.csr" \
+	if ! openssl x509 -req -in "$MITM_CA_DIR/echo.csr" \
 		-CA "$MITM_CA_DIR/tls.crt" -CAkey "$MITM_CA_DIR/tls.key" -CAcreateserial \
-		-out "$MITM_CA_DIR/echo.crt" -days 2 -extfile "$MITM_CA_DIR/echo.ext" >/dev/null 2>&1 \
-		|| die "echo certificate signing failed"
-	openssl verify -CAfile "$MITM_CA_DIR/tls.crt" "$MITM_CA_DIR/echo.crt" >/dev/null 2>&1 \
-		|| die "echo certificate does not verify against the pinned CA"
+		-out "$MITM_CA_DIR/echo.crt" -days 2 -extfile "$MITM_CA_DIR/echo.ext" 2>>"$openssl_err"; then
+		die "echo certificate signing failed: $(tail -3 "$openssl_err" 2>/dev/null | tr '\n' ' ')"
+	fi
+	if ! openssl verify -CAfile "$MITM_CA_DIR/tls.crt" "$MITM_CA_DIR/echo.crt" 2>>"$openssl_err"; then
+		die "echo certificate does not verify against the pinned CA (openssl $(openssl version 2>&1)): $(tail -5 "$openssl_err" 2>/dev/null | tr '\n' ' ')"
+	fi
 	# Ops-runbook distribution, collapsed into one namespace here (the pool
 	# and template-build namespaces coincide): the keypair entries feed the
 	# egress seed mount, the certificate-only entry (ca.crt) feeds the server
