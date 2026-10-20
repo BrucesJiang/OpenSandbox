@@ -168,6 +168,7 @@ MITM_ECHO_CONTAINER="${MITM_ECHO_CONTAINER:-fast-sandbox-env-mitm-echo}"
 MITM_ECHO_DOMAIN="${MITM_ECHO_DOMAIN:-echo.test}"
 MITM_ECHO_PORT=443
 MITM_ECHO_IP=""
+MITM_ECHO_NET=""
 
 image_repo() { printf '%s' "${1%:*}"; }
 image_tag() { printf '%s' "${1##*:}"; }
@@ -407,6 +408,17 @@ failure_dump() {
 		if [[ -f "$LOGS_DIR/mitm-ca-openssl.err" ]]; then
 			echo "-- openssl stderr (last MITM CA stage failure) --"
 			tail -20 "$LOGS_DIR/mitm-ca-openssl.err" 2>&1 || true
+		fi
+		if [[ -f "$LOGS_DIR/mitm-echo-probe.err" ]]; then
+			echo "-- echo endpoint probe stderr --"
+			tail -20 "$LOGS_DIR/mitm-echo-probe.err" 2>&1 || true
+		fi
+		if [[ -s "$MITM_CA_DIR/tls.crt" && -s "$MITM_CA_DIR/echo.crt" ]]; then
+			echo "-- certificate extensions (public material) --"
+			for cert in tls echo; do
+				openssl x509 -in "$MITM_CA_DIR/$cert.crt" -noout -subject -issuer -text 2>/dev/null \
+					| grep -E "subject=|issuer=|Basic Constraints|CA:|Key Usage|Alternative|Extended" || true
+			done
 		fi
 		if [[ -f "$LOGS_DIR/mitm-guest-curl.err" ]]; then
 			echo "-- last guest curl stderr ($LOGS_DIR/mitm-guest-curl.err) --"
@@ -1028,19 +1040,49 @@ mitm_ca_up() {
 	# across runs (the template that bakes it is rebuilt each time anyway);
 	# down() removes the directory so a stale CA can never resurface.
 	rm -f "$MITM_CA_DIR"/tls.crt "$MITM_CA_DIR"/tls.key "$MITM_CA_DIR"/tls.srl \
-		"$MITM_CA_DIR"/echo.crt "$MITM_CA_DIR"/echo.key "$MITM_CA_DIR"/echo.csr "$MITM_CA_DIR"/echo.ext \
+		"$MITM_CA_DIR"/ca.cnf "$MITM_CA_DIR"/echo.crt "$MITM_CA_DIR"/echo.key "$MITM_CA_DIR"/echo.csr "$MITM_CA_DIR"/echo.ext \
 		"$MITM_CA_FINGERPRINT_FILE"
 	# Versioned, immutable-by-convention CA (the v1 of opensandbox-mitm-ca-*):
 	# a real signing CA (keyCertSign), what the egress seed validator demands.
-	# Every openssl call captures stderr into $openssl_err so a failure
-	# carries the toolchain's own diagnosis, not just our message.
-	if ! openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+	# Extensions ride an explicit config file (-config + -extensions), not
+	# -addext: the runner-family openssl builds seen in CI (1.1.1k-FIPS)
+	# have verifier quirks, so generation sticks to the most portable form
+	# (config sections work identically from 1.0.2 through 3.x). Every
+	# openssl call captures stderr into $openssl_err so a failure carries
+	# the toolchain's own diagnosis, not just our message.
+	cat > "$MITM_CA_DIR/ca.cnf" <<CNF
+[req]
+distinguished_name = dn
+prompt = no
+
+[dn]
+CN = $MITM_CA_SECRET
+
+[v3_ca]
+basicConstraints = critical, CA:TRUE
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always, issuer
+
+[v3_echo]
+subjectAltName = DNS:$MITM_ECHO_DOMAIN
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid, issuer
+CNF
+	if ! openssl req -x509 -new -newkey rsa:2048 -nodes -days 2 \
 		-keyout "$MITM_CA_DIR/tls.key" -out "$MITM_CA_DIR/tls.crt" \
-		-subj "/CN=$MITM_CA_SECRET" \
-		-addext "basicConstraints=critical,CA:TRUE" \
-		-addext "keyUsage=critical,keyCertSign,cRLSign" 2>"$openssl_err"; then
+		-config "$MITM_CA_DIR/ca.cnf" -extensions v3_ca 2>"$openssl_err"; then
 		die "pinned MITM CA generation failed (openssl $(openssl version 2>&1)): $(tail -3 "$openssl_err" 2>/dev/null | tr '\n' ' ')"
 	fi
+	# Generator self-check: a build that silently drops the CA constraint
+	# would seed cleanly and fail every downstream TLS handshake with an
+	# opaque issuer-lookup error — refuse it here, with the evidence.
+	if ! openssl x509 -in "$MITM_CA_DIR/tls.crt" -noout -text 2>/dev/null | grep -q "CA:TRUE"; then
+		die "generated CA certificate lacks BasicConstraints CA:TRUE (openssl $(openssl version 2>&1) misbehaved): $(openssl x509 -in "$MITM_CA_DIR/tls.crt" -noout -text 2>/dev/null | grep -A1 -E 'Basic Constraints|Key Usage' | tr '\n' ' ')"
+	fi
+	log "pinned CA extensions: $(openssl x509 -in "$MITM_CA_DIR/tls.crt" -noout -text 2>/dev/null | grep -A1 -E 'Basic Constraints|Key Usage' | tr '\n' ';' | tr -s ' ')"
 	MITM_CA_FINGERPRINT="$(mitm_ca_fingerprint "$MITM_CA_DIR/tls.crt")"
 	[[ "$MITM_CA_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]] \
 		|| die "generated MITM CA fingerprint is malformed: $MITM_CA_FINGERPRINT"
@@ -1053,11 +1095,10 @@ mitm_ca_up() {
 		-subj "/CN=$MITM_ECHO_DOMAIN" 2>>"$openssl_err"; then
 		die "echo certificate request generation failed: $(tail -3 "$openssl_err" 2>/dev/null | tr '\n' ' ')"
 	fi
-	printf 'subjectAltName=DNS:%s\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n' \
-		"$MITM_ECHO_DOMAIN" > "$MITM_CA_DIR/echo.ext"
 	if ! openssl x509 -req -in "$MITM_CA_DIR/echo.csr" \
 		-CA "$MITM_CA_DIR/tls.crt" -CAkey "$MITM_CA_DIR/tls.key" -CAcreateserial \
-		-out "$MITM_CA_DIR/echo.crt" -days 2 -extfile "$MITM_CA_DIR/echo.ext" 2>>"$openssl_err"; then
+		-out "$MITM_CA_DIR/echo.crt" -days 2 \
+		-extfile "$MITM_CA_DIR/ca.cnf" -extensions v3_echo 2>>"$openssl_err"; then
 		die "echo certificate signing failed: $(tail -3 "$openssl_err" 2>/dev/null | tr '\n' ' ')"
 	fi
 	# Structural chain check (issuer == CA subject): deliberately NOT
@@ -1147,6 +1188,7 @@ PY
 		/etc/mitm-echo/tls.crt /etc/mitm-echo/tls.key >/dev/null \
 		|| die "TLS echo container failed to start"
 	MITM_ECHO_IP="$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$v.IPAddress}}{{end}}' "$MITM_ECHO_CONTAINER")"
+	MITM_ECHO_NET="$net"
 	[[ -n "$MITM_ECHO_IP" ]] || die "could not resolve the echo container IP on network $net"
 	wait_for "TLS echo endpoint answering on $MITM_ECHO_IP:$MITM_ECHO_PORT" 30 mitm_echo_ready
 	probe="$(mitm_echo_headers 'X-Mitm-Echo-Probe: env-up')"
@@ -1156,25 +1198,32 @@ PY
 }
 
 mitm_echo_ready() {
-	[[ -n "$MITM_ECHO_IP" ]] || return 1
-	curl -fsS -m 5 --noproxy '*' --cacert "$MITM_CA_DIR/tls.crt" \
+	[[ -n "$MITM_ECHO_IP" && -n "$MITM_ECHO_NET" ]] || return 1
+	mitm_echo_curl >/dev/null 2>&1
+}
+
+# mitm_echo_curl [extra-header]: HTTPS probe of the echo endpoint from a
+# container ON the kind network (the resolve_rustfs_endpoint precedent) —
+# the host->docker-bridge route is not a path this environment relies on
+# anywhere else. Runs the locally built egress image's curl, verifying the
+# chain against the pinned CA (probe stderr lands in
+# $LOGS_DIR/mitm-echo-probe.err for the failure dump).
+mitm_echo_curl() {
+	local extra=()
+	[[ -n "${1:-}" ]] && extra=(-H "$1")
+	docker run --rm --network "$MITM_ECHO_NET" \
+		--entrypoint curl \
+		-v "$MITM_CA_DIR/tls.crt":/probe/ca.crt:ro \
+		-e HOME=/tmp \
+		"${extra[@]}" \
+		-fsS -m 10 --noproxy '*' --cacert /probe/ca.crt \
 		--resolve "$MITM_ECHO_DOMAIN:$MITM_ECHO_PORT:$MITM_ECHO_IP" \
-		"https://$MITM_ECHO_DOMAIN:$MITM_ECHO_PORT/echo" >/dev/null 2>&1
+		"https://$MITM_ECHO_DOMAIN:$MITM_ECHO_PORT/echo" 2>"$LOGS_DIR/mitm-echo-probe.err"
 }
 
 # mitm_echo_headers [extra-header] -> reflected request headers (JSON body).
-# Host-side direct probe of the endpoint itself.
 mitm_echo_headers() {
-	local extra="${1:-}"
-	if [[ -n "$extra" ]]; then
-		curl -fsS -m 10 --noproxy '*' --cacert "$MITM_CA_DIR/tls.crt" \
-			--resolve "$MITM_ECHO_DOMAIN:$MITM_ECHO_PORT:$MITM_ECHO_IP" \
-			-H "$extra" "https://$MITM_ECHO_DOMAIN:$MITM_ECHO_PORT/echo" 2>/dev/null
-	else
-		curl -fsS -m 10 --noproxy '*' --cacert "$MITM_CA_DIR/tls.crt" \
-			--resolve "$MITM_ECHO_DOMAIN:$MITM_ECHO_PORT:$MITM_ECHO_IP" \
-			"https://$MITM_ECHO_DOMAIN:$MITM_ECHO_PORT/echo" 2>/dev/null
-	fi
+	mitm_echo_curl "${1:-}"
 }
 
 # --- stage: control plane -------------------------------------------------------------------
