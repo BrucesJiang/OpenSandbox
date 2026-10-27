@@ -221,6 +221,151 @@ func TestVaultV2EmptyAndUnknownStateDoNotBecomeAbsent(t *testing.T) {
 	}
 }
 
+func TestNullBindingLazyVaultAccessPreservesProtectedDiskState(t *testing.T) {
+	for _, file := range []struct {
+		name string
+		raw  []byte
+	}{
+		{name: "active v2", raw: encodeVaultV2Fixture(t, credentialvault.FileStateActive, 7, 12, "", bundleVaultBody(t))},
+		{name: "deleted v2", raw: encodeVaultV2Fixture(t, credentialvault.FileStateDeleted, 0, 13, "", emptyVaultFileBody())},
+		{name: "empty v2", raw: encodeVaultV2Fixture(t, credentialvault.FileStateEmpty, 0, 14, "init-1", emptyVaultFileBody())},
+		{name: "foreign fence v2", raw: []byte(strings.Replace(string(encodeVaultV2Fixture(t, credentialvault.FileStateActive, 7, 12, "", bundleVaultBody(t))), testFenceR, "runtime-foreign", 1))},
+		{name: "truncated v2", raw: []byte(`{"v":2,"incarnation":"runtime-1"`)},
+		{name: "unknown schema", raw: []byte(`{"v":9,"incarnation":"runtime-1","attachmentId":"attachment-1","revision":7,"vault":{}}` + "\n")},
+		{name: "unreadable bytes", raw: []byte("not-json\n")},
+	} {
+		for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete} {
+			t.Run(file.name+"/"+method, func(t *testing.T) {
+				h := newVaultPersistHarness(t)
+				f := seedVaultV2Fixture(h, vaultTestUID, file.raw)
+				set := doAction(t, h.srv, bindBody(t, vaultTestUID, vaultTestIP, testFenceR, testFenceA, 1, nil))
+				require.Equal(t, http.StatusOK, set.Code)
+				before := append([]byte(nil), f.data...)
+				body := ""
+				if method == http.MethodPost {
+					body = `{"credentials":[],"bindings":[]}`
+				} else if method == http.MethodPut {
+					body = `{"credentials":[],"bindings":[]}`
+				}
+				rec := doVault(t, h.srv, method, vaultTestUID, body, "")
+				assert.Equal(t, http.StatusServiceUnavailable, rec.Code, "lazy materialization must not expose or overwrite protected state")
+				assert.True(t, f.exists)
+				assert.Equal(t, before, f.data)
+				assert.Zero(t, f.saveCalls)
+				assert.Zero(t, f.deleteCalls, "lazy inspection must never quarantine")
+			})
+		}
+	}
+}
+
+func TestNullBindingLazyVaultProtectionIsStickyAndRetriesTransientIO(t *testing.T) {
+	for _, replacement := range []string{"missing", "legacy"} {
+		t.Run("protected-state-"+replacement, func(t *testing.T) {
+			h := newVaultPersistHarness(t)
+			f := seedVaultV2Fixture(h, vaultTestUID, encodeVaultV2Fixture(t, credentialvault.FileStateEmpty, 0, 14, "init-1", emptyVaultFileBody()))
+			require.Equal(t, http.StatusOK, doAction(t, h.srv, bindBody(t, vaultTestUID, vaultTestIP, testFenceR, testFenceA, 1, nil)).Code)
+			assert.Equal(t, http.StatusServiceUnavailable, doVault(t, h.srv, http.MethodGet, vaultTestUID, "", "").Code)
+			if replacement == "missing" {
+				f.data, f.exists = nil, false
+			} else {
+				h.seedVaultFile(vaultTestUID, testFenceR, testFenceA, 7, `{"credentials":[],"bindings":[]}`)
+			}
+			before := append([]byte(nil), f.data...)
+			for _, method := range []string{http.MethodGet, http.MethodPost} {
+				body := ""
+				if method == http.MethodPost {
+					body = `{"credentials":[],"bindings":[]}`
+				}
+				assert.Equal(t, http.StatusServiceUnavailable, doVault(t, h.srv, method, vaultTestUID, body, "").Code)
+			}
+			assert.Equal(t, before, f.data)
+			assert.Zero(t, f.saveCalls)
+			assert.Zero(t, f.deleteCalls)
+		})
+	}
+
+	for _, source := range []string{"snapshot", "storeFor"} {
+		t.Run("transient-"+source, func(t *testing.T) {
+			h := newVaultPersistHarness(t)
+			f := h.fileFor(vaultTestUID)
+			h.seedVaultFile(vaultTestUID, testFenceR, testFenceA, 7, `{"credentials":[],"bindings":[]}`)
+			if source == "snapshot" {
+				f.snapErr = errors.New("temporary snapshot error")
+			} else {
+				h.newFileErr = errors.New("temporary store error")
+			}
+			require.Equal(t, http.StatusOK, doAction(t, h.srv, bindBody(t, vaultTestUID, vaultTestIP, testFenceR, testFenceA, 1, nil)).Code)
+			assert.Equal(t, http.StatusServiceUnavailable, doVault(t, h.srv, http.MethodGet, vaultTestUID, "", "").Code)
+			f.snapErr = nil
+			assert.Equal(t, http.StatusNotFound, doVault(t, h.srv, http.MethodGet, vaultTestUID, "", "").Code, "a successful v1/absence probe restores legacy empty-vault behavior")
+			assert.True(t, f.exists)
+			assert.Zero(t, f.saveCalls)
+			assert.Zero(t, f.deleteCalls)
+		})
+	}
+}
+
+func TestNullBindingLazyVaultMaterializationPreservesLegacyAndSealSemantics(t *testing.T) {
+	for _, withFile := range []bool{false, true} {
+		t.Run(map[bool]string{false: "absent", true: "legacy-v1"}[withFile], func(t *testing.T) {
+			h := newVaultPersistHarness(t)
+			f := h.fileFor(vaultTestUID)
+			if withFile {
+				h.seedVaultFile(vaultTestUID, testFenceR, testFenceA, 7, `{"credentials":[],"bindings":[]}`)
+			}
+			before := append([]byte(nil), f.data...)
+			require.Equal(t, http.StatusOK, doAction(t, h.srv, bindBody(t, vaultTestUID, vaultTestIP, testFenceR, testFenceA, 1, nil)).Code)
+			assert.Equal(t, http.StatusNotFound, doVault(t, h.srv, http.MethodGet, vaultTestUID, "", "").Code)
+			assert.Equal(t, before, f.data)
+			assert.Zero(t, f.deleteCalls)
+			post := doVault(t, h.srv, http.MethodPost, vaultTestUID, `{"credentials":[],"bindings":[]}`, "")
+			assert.Equal(t, http.StatusCreated, post.Code, "legacy v1/no-file subjects retain the v1 writer behavior")
+		})
+	}
+
+	h := newVaultPersistHarness(t)
+	subj := subject.FromSandboxUID(vaultTestUID)
+	require.NoError(t, h.vp.seal(subj))
+	require.Equal(t, http.StatusOK, doAction(t, h.srv, bindBody(t, vaultTestUID, vaultTestIP, testFenceR, testFenceA, 1, nil)).Code)
+	assert.Equal(t, http.StatusConflict, doVault(t, h.srv, http.MethodGet, vaultTestUID, "", "").Code)
+	assert.Equal(t, http.StatusConflict, doVault(t, h.srv, http.MethodPost, vaultTestUID, `{"credentials":[],"bindings":[]}`, "").Code)
+	active := httptest.NewRecorder()
+	h.srv.handleCredentialVaultActive(active, httptest.NewRequest(http.MethodGet, "/credential-vault/_active?clientIp="+vaultTestIP, nil))
+	assert.Equal(t, http.StatusConflict, active.Code, "the restored seal also covers the addon active-snapshot path")
+	f := h.fileFor(vaultTestUID)
+	assert.False(t, f.exists)
+	assert.Zero(t, f.saveCalls)
+}
+
+func TestNullBindingLazyVaultMaterializationProtectsActiveAddonAndMemoryOnlyLegacy(t *testing.T) {
+	h := newVaultPersistHarness(t)
+	seedVaultV2Fixture(h, vaultTestUID, encodeVaultV2Fixture(t, credentialvault.FileStateActive, 7, 12, "", bundleVaultBody(t)))
+	require.Equal(t, http.StatusOK, doAction(t, h.srv, bindBody(t, vaultTestUID, vaultTestIP, testFenceR, testFenceA, 1, nil)).Code)
+	active := httptest.NewRecorder()
+	h.srv.handleCredentialVaultActive(active, httptest.NewRequest(http.MethodGet, "/credential-vault/_active?clientIp="+vaultTestIP, nil))
+	assert.Equal(t, http.StatusServiceUnavailable, active.Code, "the addon path must not expose a lazy v2 file as an empty snapshot")
+
+	srv, _, _ := fastSandboxTestServer(t)
+	require.Equal(t, http.StatusOK, doAction(t, srv, bindBody(t, "memory-only", vaultTestIP, testFenceR, testFenceA, 1, nil)).Code)
+	assert.Equal(t, http.StatusNotFound, doVault(t, srv, http.MethodGet, "memory-only", "", "").Code)
+	assert.Equal(t, http.StatusCreated, doVault(t, srv, http.MethodPost, "memory-only", `{"credentials":[],"bindings":[]}`, "").Code)
+}
+
+func TestNullBindingVaultExportRejectsProtectedStateBeforeSeal(t *testing.T) {
+	h := newVaultPersistHarness(t)
+	raw := encodeVaultV2Fixture(t, credentialvault.FileStateDeleted, 0, 13, "", emptyVaultFileBody())
+	f := seedVaultV2Fixture(h, snapshotTestUID, raw)
+	require.Equal(t, http.StatusOK, doAction(t, h.srv, bindBody(t, snapshotTestUID, snapshotTestIP, testFenceR, testFenceA, 1, nil)).Code)
+	target := filepath.Join(t.TempDir(), "bundle", "v2.json")
+	rec := doAction(t, h.srv, snapshotBody(t, snapshotTestUID, testFenceR, testFenceA, "VAULT_EXPORT", target))
+	assert.Equal(t, http.StatusConflict, rec.Code)
+	assert.Equal(t, raw, f.data)
+	assert.False(t, h.fakeForPath(target).exists, "rejected export must not create a bundle copy")
+	assert.False(t, h.vp.isSealed(subject.FromSandboxUID(snapshotTestUID)), "rejected export must not seal")
+	assert.Zero(t, f.saveCalls)
+	assert.Zero(t, f.deleteCalls)
+}
+
 func TestVaultV2ExportAndImportFailBeforeSideEffects(t *testing.T) {
 	h := newVaultPersistHarness(t)
 	active := encodeVaultV2Fixture(t, credentialvault.FileStateActive, 7, 12, "", bundleVaultBody(t))

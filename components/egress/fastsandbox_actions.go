@@ -245,7 +245,7 @@ func (s *fastSandboxPolicyServer) applySetBinding(ctx context.Context, env *acti
 			return http.StatusInternalServerError, fmt.Errorf("active subject %s has no registered network", subj)
 		}
 	}
-	willPurge := token != nil && (!token.expectedNew.Matches(fence) || !token.purged) || token == nil && registered && !old.Matches(fence)
+	willPurge := (token != nil && (!token.expectedNew.Matches(fence) || !token.purged)) || (token == nil && registered && !old.Matches(fence))
 	if willPurge {
 		status, purgeErr := s.vaultPurgeStatusLocked(subj)
 		if purgeErr != nil {

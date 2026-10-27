@@ -377,7 +377,14 @@ func (s *fastSandboxPolicyServer) handleCredentialVaultActive(w http.ResponseWri
 		if !registered || !s.fenceMatchesLocked(subj, fence) || s.subjAtt[subj].IP != ip {
 			return func(w http.ResponseWriter) { http.Error(w, "no subject for clientIp", http.StatusNotFound) }
 		}
-		return captureActiveVaultSnapshot(r, s.vaultForLocked(subj, fence))
+		store := s.vaultForLocked(subj, fence)
+		if s.vaultSealedLocked(subj) {
+			return func(w http.ResponseWriter) { http.Error(w, "subject vault is sealed", http.StatusConflict) }
+		}
+		if entry := s.vaults[subj]; entry.vaultStateUnknown {
+			return func(w http.ResponseWriter) { http.Error(w, "vault state is unknown", http.StatusServiceUnavailable) }
+		}
+		return captureActiveVaultSnapshot(r, store)
 	}()
 	respond(w)
 }
@@ -425,9 +432,12 @@ type vaultEntry struct {
 	fileMeta          vaultFileMetadata
 	vaultStateUnknown bool
 	// vaultStateProtected records that this live fence previously observed a
-	// non-v1 source (v2 or an unsupported schema). A later missing/legacy file
-	// cannot erase that provenance and reopen the v1 writer path.
+	// non-v1 or unreadable source. A later missing/legacy file cannot erase that
+	// provenance and reopen the v1 writer path.
 	vaultStateProtected bool
+	// lazyVaultProbe limits retry-on-read to entries first created without a
+	// binding reload; ordinary reload failures still require SET_BINDING replay.
+	lazyVaultProbe bool
 }
 
 // vaultFileMetadata keeps the complete decoded ordering/initialization
@@ -471,12 +481,24 @@ func (s *fastSandboxPolicyServer) vaultForLocked(subj subject.Subject, fence sub
 	}
 	if e, ok := s.vaults[subj]; ok {
 		if e.fence == fence {
+			if e.lazyVaultProbe && e.vaultStateUnknown && !e.vaultStateProtected {
+				s.inspectLazyVaultStateLocked(subj, &e)
+			}
+			if s.vaultFiles != nil && s.vaultFiles.isSealed(subj) {
+				e.sealed = true
+			}
+			s.vaults[subj] = e
 			return e.store
 		}
 		delete(s.vaults, subj)
 	}
 	v := credentialvault.NewStore(nil, func() bool { return true })
-	s.vaults[subj] = vaultEntry{store: v, fence: fence}
+	e := vaultEntry{store: v, fence: fence, lazyVaultProbe: true}
+	s.inspectLazyVaultStateLocked(subj, &e)
+	if s.vaultFiles != nil && s.vaultFiles.isSealed(subj) {
+		e.sealed = true
+	}
+	s.vaults[subj] = e
 	return v
 }
 

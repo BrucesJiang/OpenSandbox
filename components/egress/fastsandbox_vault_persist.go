@@ -308,6 +308,44 @@ func (p *vaultPersistence) isSealed(subj subject.Subject) bool {
 	return err == nil
 }
 
+// inspectLazyVaultStateLocked discovers only whether a lazy vault must stay
+// unavailable to the v1 relay path. Removal bindings have no policy against
+// which to reload legacy contents, so this deliberately does not import or
+// quarantine v1 files. Callers hold s.mu.
+func (s *fastSandboxPolicyServer) inspectLazyVaultStateLocked(subj subject.Subject, entry *vaultEntry) {
+	if s.vaultFiles == nil || entry.vaultStateProtected {
+		return
+	}
+	fileStore, err := s.vaultFiles.storeFor(subj)
+	if err != nil {
+		entry.degraded = fmt.Sprintf("vault file store unavailable: %v", err)
+		entry.vaultStateUnknown = true
+		return
+	}
+	snapshot, err := fileStore.Snapshot()
+	if err != nil {
+		entry.degraded = fmt.Sprintf("vault file unreadable: %v", err)
+		entry.vaultStateUnknown = true
+		return
+	}
+	entry.degraded = ""
+	entry.vaultStateUnknown = false
+	if !snapshot.Exists() {
+		return
+	}
+	vf, _, decodeErr := credentialvault.DecodeVaultFile(snapshot.Data())
+	if decodeErr == nil && vf.Version == credentialvault.VaultFileVersion {
+		return
+	}
+	entry.vaultStateProtected = true
+	entry.vaultStateUnknown = true
+	entry.degraded = "unreadable or non-v1 vault state requires a lineage-aware reload"
+	entry.fileMeta = vaultFileMetadata{
+		version: vf.Version, revision: vf.Revision, state: vf.State, lineage: vf.StateLineage,
+		stateRevision: vf.StateRevision, initializationID: vf.InitializationID,
+	}
+}
+
 // SetVaultFiles wires persistence under the relay handlers; nil (the default)
 // keeps the vault memory-only.
 func (s *fastSandboxPolicyServer) SetVaultFiles(vp *vaultPersistence) {

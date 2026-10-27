@@ -235,9 +235,7 @@ func (s *fastSandboxPolicyServer) exportSourceImageLocked(subj subject.Subject, 
 		// treated as absent, preserving the legacy behavior.
 		if decErr != nil || vf.Incarnation != regFence.RuntimeInstanceID || vf.AttachmentID != regFence.AttachmentID {
 			what := "unattributable fence"
-			if errors.Is(decErr, credentialvault.ErrUnsupportedFileVersion) {
-				what = "newer schema (preserved for the newer writer)"
-			} else if decErr != nil {
+			if decErr != nil {
 				what = "unreadable"
 			}
 			log.Infof("subject %s: vault file not carried (%s)", subj, what)
