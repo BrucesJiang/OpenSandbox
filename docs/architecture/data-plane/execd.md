@@ -100,6 +100,8 @@ This is a sandbox-wide credential, not a restricted terminal ticket. Obtain it t
 
 One API covers the whole filesystem tree: stream files in and out, list and search directories, inspect and change permissions, replace file contents, move and remove paths. The file APIs in every sandbox SDK are a thin wrapper over these endpoints.
 
+An upload replaces its destination only after the bytes are fully written and synced: a copy that fails partway leaves the file it was replacing untouched instead of truncating it. The replacement keeps the destination's mode and, on Unix, its owner and group.
+
 ### Filesystem execution identity
 
 On Linux, a trusted backend can select the identity performing ordinary file operations by prefixing the file API path with `/v1/filesystem/{uid}/{gid}`. Both IDs are required decimal integers between 0 and 4294967294. For example, `GET /v1/filesystem/1001/1001/files/download?path=/workspace/session-b/result.txt` reads the file as UID 1001 with primary GID 1001. The same prefix supports all ordinary file and directory operations, including uploads, metadata, search, replacement, rename, deletion, and permission changes.
