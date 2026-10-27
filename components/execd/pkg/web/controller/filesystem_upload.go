@@ -204,8 +204,8 @@ func writeUploadStream(target string, r io.Reader) *uploadError {
 	existing, statErr := os.Stat(resolvedTarget)
 	switch {
 	case statErr == nil && !existing.Mode().IsRegular():
-		// A device or a FIFO cannot be staged and renamed over without being
-		// replaced by a regular file, so keep refusing them as before.
+		// A device or a FIFO cannot be staged and renamed over without replacing
+		// the node with a regular file, so refuse them.
 		return newUploadError(
 			http.StatusInternalServerError,
 			model.ErrorCodeRuntimeError,
@@ -256,7 +256,7 @@ func writeUploadStream(target string, r io.Reader) *uploadError {
 		if err := tmp.Chmod(existing.Mode().Perm()); err != nil {
 			return uploadWriteError(resolvedTarget, err)
 		}
-		if err := copyFileOwnership(tmpName, existing); err != nil {
+		if err := copyFileOwnership(tmp, existing); err != nil {
 			log.Warn("upload: preserve owner/group of %s: %v", resolvedTarget, err)
 		}
 	}

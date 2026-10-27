@@ -100,7 +100,7 @@ This is a sandbox-wide credential, not a restricted terminal ticket. Obtain it t
 
 One API covers the whole filesystem tree: stream files in and out, list and search directories, inspect and change permissions, replace file contents, move and remove paths. The file APIs in every sandbox SDK are a thin wrapper over these endpoints.
 
-An upload replaces its destination only after the bytes are fully written and synced: a copy that fails partway leaves the file it was replacing untouched instead of truncating it. The replacement keeps the destination's mode and, on Unix, its owner and group.
+An upload is staged next to its destination and renamed into place, so a copy that fails partway leaves the file it was replacing untouched instead of truncating it. The replacement keeps the destination's mode and, where the platform allows it, its owner and group.
 
 ### Filesystem execution identity
 

@@ -22,16 +22,18 @@ import (
 	"syscall"
 )
 
-// copyFileOwnership records the owner and group of info on path, so staging a
-// file and renaming it over an existing one keeps the ownership an in-place
-// write preserved.
-func copyFileOwnership(path string, info os.FileInfo) error {
+// copyFileOwnership records the owner and group of info on file, so staging an
+// upload and renaming it over an existing one keeps the ownership an in-place
+// write preserved. The open descriptor is used rather than the staging path:
+// the staging directory is writable, so the name could be swapped between
+// creation and this call.
+func copyFileOwnership(file *os.File, info os.FileInfo) error {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return nil
 	}
-	if err := os.Chown(path, int(stat.Uid), int(stat.Gid)); err != nil {
-		return fmt.Errorf("chown %s to %d:%d: %w", path, stat.Uid, stat.Gid, err)
+	if err := file.Chown(int(stat.Uid), int(stat.Gid)); err != nil {
+		return fmt.Errorf("chown to %d:%d: %w", stat.Uid, stat.Gid, err)
 	}
 	return nil
 }

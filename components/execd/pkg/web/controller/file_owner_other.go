@@ -20,6 +20,6 @@ import "os"
 
 // copyFileOwnership is a no-op where the platform exposes no numeric owner and
 // group on a FileInfo.
-func copyFileOwnership(string, os.FileInfo) error {
+func copyFileOwnership(*os.File, os.FileInfo) error {
 	return nil
 }

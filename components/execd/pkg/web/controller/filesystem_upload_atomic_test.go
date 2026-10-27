@@ -87,6 +87,60 @@ func TestWriteUploadStreamReplacesContent(t *testing.T) {
 	requireNoUploadStaging(t, dir)
 }
 
+// A successful replacement keeps the destination mode an in-place write kept:
+// the staging file starts at the create default, so only explicit preservation
+// makes this pass.
+func TestWriteUploadStreamPreservesDestinationMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows only models the read-only bit")
+	}
+	dir := t.TempDir()
+	target := filepath.Join(dir, "secret.txt")
+	require.NoError(t, os.WriteFile(target, []byte("old"), 0o640))
+
+	uerr := writeUploadStream(target, bytes.NewReader([]byte("new")))
+
+	require.Nil(t, uerr)
+	info, err := os.Stat(target)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o640), info.Mode().Perm())
+}
+
+// A destination that cannot be written keeps failing: the rename alone would
+// only need a writable directory.
+func TestWriteUploadStreamRejectsReadOnlyDestination(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "locked.txt")
+	require.NoError(t, os.WriteFile(target, []byte("old"), 0o644))
+	require.NoError(t, os.Chmod(target, 0o444))
+	if probe, err := os.OpenFile(target, os.O_WRONLY, 0); err == nil {
+		// root can write a read-only file; the rejection is unobservable here.
+		_ = probe.Close()
+		t.Skip("process bypasses file permissions")
+	}
+
+	uerr := writeUploadStream(target, bytes.NewReader([]byte("new")))
+
+	require.NotNil(t, uerr)
+	got, err := os.ReadFile(target)
+	require.NoError(t, err)
+	require.Equal(t, "old", string(got))
+}
+
+func TestWriteUploadStreamRejectsNonRegularDestination(t *testing.T) {
+	dir := t.TempDir()
+	subdir := filepath.Join(dir, "a-directory")
+	require.NoError(t, os.Mkdir(subdir, 0o755))
+
+	uerr := writeUploadStream(subdir, bytes.NewReader([]byte("new")))
+
+	require.NotNil(t, uerr)
+	info, err := os.Stat(subdir)
+	require.NoError(t, err)
+	require.True(t, info.IsDir(), "the destination itself must be untouched")
+	requireNoUploadStaging(t, dir)
+}
+
 // An upload to a symlinked path keeps writing the link target, as an in-place
 // write did, instead of replacing the link with a regular file.
 func TestWriteUploadStreamFollowsSymlinkTarget(t *testing.T) {
