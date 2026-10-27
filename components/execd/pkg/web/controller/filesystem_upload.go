@@ -233,6 +233,12 @@ func writeUploadStream(target string, r io.Reader) *uploadError {
 
 	tmp, err := createUploadTemp(filepath.Dir(resolvedTarget))
 	if err != nil {
+		// A directory that is only traversable (0555, or a 0666 file in it) was
+		// writable in place before staging existed. Keep that upload working
+		// through the legacy path; its tradeoff is documented on the route.
+		if statErr == nil && errors.Is(err, fs.ErrPermission) {
+			return writeUploadInPlace(resolvedTarget, r)
+		}
 		return newUploadError(
 			http.StatusInternalServerError,
 			model.ErrorCodeRuntimeError,
@@ -249,23 +255,23 @@ func writeUploadStream(target string, r io.Reader) *uploadError {
 		_ = os.Remove(tmpName)
 	}()
 
-	if statErr == nil {
-		// An in-place write kept the metadata of the file it overwrote: carry
-		// the mode over, and the owner/group where the platform exposes them,
-		// so replacing the file does not change who can read or write it.
-		if err := tmp.Chmod(existing.Mode().Perm()); err != nil {
-			return uploadWriteError(resolvedTarget, err)
-		}
-		if err := copyFileOwnership(tmp, existing); err != nil {
-			log.Warn("upload: preserve owner/group of %s: %v", resolvedTarget, err)
-		}
-	}
-
 	if _, err := io.Copy(tmp, r); err != nil {
 		return uploadWriteError(resolvedTarget, err)
 	}
+
+	if statErr == nil {
+		// Apply metadata after the content: writing and chown both clear
+		// setuid/setgid, so doing this before io.Copy silently dropped them.
+		if err := copyFileOwnership(tmp, existing); err != nil {
+			log.Warn("upload: preserve owner/group of %s: %v", resolvedTarget, err)
+		}
+		if err := tmp.Chmod(uploadDestinationMode(existing.Mode())); err != nil {
+			return uploadWriteError(resolvedTarget, err)
+		}
+	}
+
 	if err := tmp.Sync(); err != nil {
-		log.Error("upload: sync target file: %v", err)
+		return uploadWriteError(resolvedTarget, err)
 	}
 	if err := tmp.Close(); err != nil {
 		return uploadWriteError(resolvedTarget, err)
@@ -284,6 +290,35 @@ func writeUploadStream(target string, r io.Reader) *uploadError {
 			log.Warn("upload: sync parent dir %s: %v", targetDir, err)
 		}
 		_ = d.Close()
+	}
+	return nil
+}
+
+// uploadDestinationMode keeps the permission bits an in-place write preserved,
+// including setuid/setgid/sticky: a rename replaces the inode, so the staged
+// file has to carry them explicitly.
+func uploadDestinationMode(mode os.FileMode) os.FileMode {
+	return mode & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
+}
+
+// writeUploadInPlace is the legacy path for a destination whose directory is
+// not writable but whose file is. Unlike the staged path it truncates first, so
+// a copy that fails partway loses the previous content.
+func writeUploadInPlace(target string, r io.Reader) *uploadError {
+	file, err := os.OpenFile(target, os.O_WRONLY|os.O_TRUNC, 0)
+	if err != nil {
+		return newUploadError(
+			http.StatusInternalServerError,
+			model.ErrorCodeRuntimeError,
+			fmt.Sprintf("error opening destination file %s. %v", target, err),
+		)
+	}
+	defer file.Close()
+	if _, err := io.Copy(file, r); err != nil {
+		return uploadWriteError(target, err)
+	}
+	if err := file.Sync(); err != nil {
+		return uploadWriteError(target, err)
 	}
 	return nil
 }

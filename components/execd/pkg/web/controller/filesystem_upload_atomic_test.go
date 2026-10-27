@@ -195,3 +195,65 @@ func TestUploadFileWritesThroughMultipart(t *testing.T) {
 	}
 	requireNoUploadStaging(t, dir)
 }
+
+// A rename replaces the inode, so a setuid/setgid bit the old in-place write
+// kept would silently disappear unless the staged file carries it too.
+func TestUploadDestinationModeKeepsSpecialBits(t *testing.T) {
+	mode := os.FileMode(0o750) | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+	require.Equal(t, mode, uploadDestinationMode(mode))
+	require.Equal(t, os.FileMode(0o640), uploadDestinationMode(0o640))
+}
+
+func TestWriteUploadStreamPreservesSpecialModeBits(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows only models the read-only bit")
+	}
+	dir := t.TempDir()
+	target := filepath.Join(dir, "helper")
+	require.NoError(t, os.WriteFile(target, []byte("old"), 0o750))
+	require.NoError(t, os.Chmod(target, 0o750|os.ModeSetuid))
+	before, err := os.Stat(target)
+	require.NoError(t, err)
+	if before.Mode()&os.ModeSetuid == 0 {
+		t.Skip("filesystem does not keep setuid bits")
+	}
+
+	uerr := writeUploadStream(target, bytes.NewReader([]byte("new")))
+
+	require.Nil(t, uerr)
+	info, err := os.Stat(target)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o750), info.Mode().Perm())
+	require.NotZero(t, info.Mode()&os.ModeSetuid, "the replacement must keep setuid")
+}
+
+// A destination the caller can write but whose directory it cannot must keep
+// working: the staged path cannot create its sibling, so it falls back to the
+// legacy in-place write.
+func TestWriteUploadStreamFallsBackWithoutDirectoryWrite(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not model directory write permission this way")
+	}
+	dir := t.TempDir()
+	target := filepath.Join(dir, "notes.md")
+	require.NoError(t, os.WriteFile(target, []byte("old"), 0o666))
+	require.NoError(t, os.Chmod(dir, 0o555))
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	// root and some ACL setups still allow the staging file; then there is no
+	// fallback to exercise.
+	probe, probeErr := os.CreateTemp(dir, ".probe-")
+	if probeErr == nil {
+		_ = probe.Close()
+		_ = os.Remove(probe.Name())
+		t.Skip("directory stays writable for this process")
+	}
+
+	uerr := writeUploadStream(target, bytes.NewReader([]byte("new")))
+
+	require.Nil(t, uerr)
+	got, err := os.ReadFile(target)
+	require.NoError(t, err)
+	require.Equal(t, "new", string(got))
+	requireNoUploadStaging(t, dir)
+}
