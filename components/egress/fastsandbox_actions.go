@@ -214,6 +214,14 @@ func (s *fastSandboxPolicyServer) applySetBinding(ctx context.Context, env *acti
 	defer s.policyCommitMu.Unlock()
 	old, registered := s.reg.Fence(subj)
 	oldState, _ := s.reg.Get(subj)
+	if stale, ok := s.reg.Resolve(subject.SubjectKey{SourceIP: att.IP}); ok && stale != subj {
+		s.mu.Lock()
+		status, purgeErr := s.vaultPurgeStatusLocked(stale)
+		s.mu.Unlock()
+		if purgeErr != nil {
+			return status, fmt.Errorf("stale subject cleanup blocked: %w", purgeErr)
+		}
+	}
 	s.mu.Lock()
 	// Waiting for an in-progress Vault commit may outlive the request too.
 	if err := s.actionCanceled(ctx); err != nil {
@@ -235,6 +243,14 @@ func (s *fastSandboxPolicyServer) applySetBinding(ctx context.Context, env *acti
 			// reason to mutate a live subject or acknowledge an uninstalled update.
 			s.mu.Unlock()
 			return http.StatusInternalServerError, fmt.Errorf("active subject %s has no registered network", subj)
+		}
+	}
+	willPurge := token != nil && (!token.expectedNew.Matches(fence) || !token.purged) || token == nil && registered && !old.Matches(fence)
+	if willPurge {
+		status, purgeErr := s.vaultPurgeStatusLocked(subj)
+		if purgeErr != nil {
+			s.mu.Unlock()
+			return status, fmt.Errorf("subject rebind blocked: %w", purgeErr)
 		}
 	}
 	// A null binding may omit attachment only for its own known identity.
@@ -274,7 +290,11 @@ func (s *fastSandboxPolicyServer) applySetBinding(ctx context.Context, env *acti
 			}
 			s.reg.Unregister(subj)
 			s.mu.Lock()
-			s.dropSubjectStateLocked(subj) // preserve this exact token through C publication
+			if err := s.dropSubjectStateLocked(subj); err != nil { // preserve this exact token through C publication
+				status := s.vaultPurgeFailureStatusLocked(subj)
+				s.mu.Unlock()
+				return status, fmt.Errorf("subject reset purge: %w", err)
+			}
 			token.needsReset = false
 			token.oldRemoved = true
 			token.purged = true
@@ -282,7 +302,11 @@ func (s *fastSandboxPolicyServer) applySetBinding(ctx context.Context, env *acti
 		}
 		s.mu.Lock()
 		if !token.purged {
-			s.dropSubjectStateLocked(subj)
+			if err := s.dropSubjectStateLocked(subj); err != nil {
+				status := s.vaultPurgeFailureStatusLocked(subj)
+				s.mu.Unlock()
+				return status, fmt.Errorf("subject rebind purge: %w", err)
+			}
 			token.purged = true
 		}
 		removeOld := token.removeOld && !token.oldRemoved
@@ -477,8 +501,16 @@ func (s *fastSandboxPolicyServer) applyRemoveBinding(env *actionhandler.Envelope
 		log.Infof("subject %s: stale REMOVE_BINDING ignored (fence mismatch)", subj)
 		return http.StatusOK, nil
 	}
+	s.mu.Lock()
+	purgeStatus, purgeErr := s.vaultPurgeStatusLocked(subj)
+	s.mu.Unlock()
+	if purgeErr != nil {
+		return purgeStatus, fmt.Errorf("binding removal blocked: %w", purgeErr)
+	}
 	if token == nil && !ok {
+		s.policyCommitMu.Lock()
 		s.dropSubjectState(subj)
+		s.policyCommitMu.Unlock()
 		return http.StatusOK, nil
 	}
 	// expectedNew REMOVE cancels an unfinished registration intent, including
@@ -491,13 +523,20 @@ func (s *fastSandboxPolicyServer) applyRemoveBinding(env *actionhandler.Envelope
 	// Terminal file cleanup remains best-effort after Unregister. A failed
 	// delete leaves the file fenced to the old identity; this acknowledgement
 	// does not promise automatic cleanup retry.
+	s.policyCommitMu.Lock()
 	s.mu.Lock()
-	s.dropSubjectStateLocked(subj)
+	if err := s.dropSubjectStateLocked(subj); err != nil {
+		status := s.vaultPurgeFailureStatusLocked(subj)
+		s.mu.Unlock()
+		s.policyCommitMu.Unlock()
+		return status, fmt.Errorf("terminal state purge: %w", err)
+	}
 	cleared := token != nil && s.rebinds[subj] == token
 	if cleared {
 		delete(s.rebinds, subj)
 	}
 	s.mu.Unlock()
+	s.policyCommitMu.Unlock()
 	if cleared {
 		log.Infof("subject_rebind_cleared")
 	}

@@ -418,10 +418,29 @@ func (s *fastSandboxPolicyServer) applyPolicy(subj subject.Subject, pol *policy.
 // sealed marks a paused subject whose vault file was exported into the
 // snapshot bundle: every vault op answers 409; enforcement is unchanged.
 type vaultEntry struct {
-	store    *credentialvault.Store
-	fence    subject.Fencing
-	degraded string
-	sealed   bool
+	store             *credentialvault.Store
+	fence             subject.Fencing
+	degraded          string
+	sealed            bool
+	fileMeta          vaultFileMetadata
+	vaultStateUnknown bool
+	// vaultStateProtected records that this live fence previously observed a
+	// non-v1 source (v2 or an unsupported schema). A later missing/legacy file
+	// cannot erase that provenance and reopen the v1 writer path.
+	vaultStateProtected bool
+}
+
+// vaultFileMetadata keeps the complete decoded ordering/initialization
+// identity beside the read-only live slice. The source file remains the
+// durable authority; this metadata prevents a reload from silently dropping
+// lineage information even though OS-1 does not write v2 yet.
+type vaultFileMetadata struct {
+	version          int
+	revision         int64
+	state            credentialvault.FileState
+	lineage          string
+	stateRevision    uint64
+	initializationID string
 }
 
 // vaultFor returns nil for absent or rebinding subjects. Otherwise the vault
@@ -594,7 +613,11 @@ func (s *fastSandboxPolicyServer) takeoverStaleSubject(stale subject.Subject) er
 // The action gate prevents another registration from racing victim cleanup.
 func (s *fastSandboxPolicyServer) dropSubjectState(subj subject.Subject) {
 	s.mu.Lock()
-	s.dropSubjectStateLocked(subj)
+	if err := s.dropSubjectStateLocked(subj); err != nil {
+		s.mu.Unlock()
+		log.Warnf("subject %s: local state cleanup refused: %v", subj, err)
+		return
+	}
 	cleared := s.rebinds[subj] != nil
 	delete(s.rebinds, subj)
 	s.mu.Unlock()
@@ -607,13 +630,19 @@ func (s *fastSandboxPolicyServer) dropSubjectState(subj subject.Subject) {
 // SETs use it only after full kernel removal and Unregister; Vault must stay
 // guarded until the successor has completed local publication.
 func (s *fastSandboxPolicyServer) dropSubjectStateLocked(subj subject.Subject) error {
-	err := s.dropVault(subj)
+	if _, err := s.vaultPurgeStatusLocked(subj); err != nil {
+		return err
+	}
+	// v1 lifecycle cleanup is intentionally best-effort: a failed unlink is
+	// already logged by purgeVaultFile and the remaining bytes stay fenced to
+	// their recorded owner. v2/unknown schemas were refused by the preflight.
+	_ = s.dropVault(subj)
 	delete(s.policies, subj)
 	s.purgePolicyFile(subj)
 	delete(s.subjFence, subj)
 	delete(s.pendingPolicies, subj)
 	delete(s.subjAtt, subj)
-	return err
+	return nil
 }
 
 // recordBindingState records a validated network attempt before enforcement.

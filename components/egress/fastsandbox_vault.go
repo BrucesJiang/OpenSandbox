@@ -162,6 +162,16 @@ func (s *fastSandboxPolicyServer) handleVaultRelayWrite(w http.ResponseWriter, r
 		if store == nil {
 			return func() { http.Error(w, "unknown subject", http.StatusNotFound) }
 		}
+		if entry, ok := s.vaults[subj]; ok {
+			if entry.vaultStateUnknown {
+				return func() { http.Error(w, "vault state is unknown; refusing mutation", http.StatusServiceUnavailable) }
+			}
+			if entry.fileMeta.version >= credentialvault.VaultFileVersion2 {
+				return func() {
+					http.Error(w, "v2 vault state is read-only until lineage-aware writes are supported", http.StatusConflict)
+				}
+			}
+		}
 		pol := effective
 
 		var (
@@ -291,6 +301,9 @@ func (s *fastSandboxPolicyServer) readRelayVault(r *http.Request, subj subject.S
 	}
 	if s.vaultSealedLocked(subj) {
 		return credentialvault.FullRevision{}, http.StatusConflict, "subject vault is sealed (paused); the bundle copy is already taken", nil
+	}
+	if entry, ok := s.vaults[subj]; ok && entry.vaultStateUnknown {
+		return credentialvault.FullRevision{}, http.StatusServiceUnavailable, "vault state is unknown; refusing to treat it as absent", nil
 	}
 	store := s.vaultForLocked(subj, fence)
 	if store == nil {
