@@ -2029,18 +2029,28 @@ ublk_heal_wedge() {
 	log "heal: recycling the host ublk module (leaked devices die with it)"
 	# The sidecar daemons hold /dev/ublk-control open, which pins the
 	# module against modprobe -r: drop the runtime pods first. The
-	# DaemonSet rebuilds its pods on its own; rollout status waits for
-	# them. If a rebuilding daemon re-opens the control node before the
-	# unload lands, the recycle is a no-op and the re-probe below fails
-	# with the explicit reboot guidance.
+	# DaemonSet starts replacements right away, but they stay in
+	# scheduling/init for a few seconds before any daemon re-opens the
+	# control node — so retry the unload across that window. Success
+	# proves no process held it; every later open lands on the fresh
+	# module. A failed recycle is not fatal here: the re-probe decides,
+	# and its failure carries the explicit reboot guidance.
 	kubectl -n "$NS" delete pod -l component=firecracker-runtime --now --timeout=90s >/dev/null 2>&1 || true
-	sleep 3
-	sudo_ modprobe -r ublk_drv 2>/dev/null || true
+	local attempt unloaded=0
+	for attempt in 1 2 3 4 5; do
+		if sudo_ modprobe -r ublk_drv 2>/dev/null; then unloaded=1; break; fi
+		sleep 2
+	done
 	sudo_ modprobe ublk_drv 2>/dev/null || true
 	grep -qiE 'ublk-char|ublkc' /proc/devices \
 		|| die "ublk module did not register after the recycle: the runner host needs a reboot to clear the wedged ublk state"
+	if [[ "$unloaded" == 1 ]]; then
+		log "heal: ublk module recycled clean on attempt ${attempt}"
+	else
+		log "heal: modprobe -r stayed busy (a daemon re-opened the control node first); the re-probe will tell"
+	fi
 	kubectl -n "$NS" rollout status daemonset/firecracker-runtime --timeout=300s >/dev/null
-	log "heal: runtime pods rebuilt on the fresh module"
+	log "heal: runtime pods ready"
 }
 
 ublk_probe_or_heal() {
