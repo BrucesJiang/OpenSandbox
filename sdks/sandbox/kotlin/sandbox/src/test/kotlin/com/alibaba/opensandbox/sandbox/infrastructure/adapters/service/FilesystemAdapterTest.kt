@@ -139,6 +139,25 @@ class FilesystemAdapterTest {
     }
 
     @Test
+    fun `line reads report unknown total size`() {
+        for ((offset, limit) in listOf(2 to null, null to 2)) {
+            mockWebServer.enqueue(MockResponse().setBody("hello"))
+            val bytes = filesystemAdapter.readByteArrayDetailed("/data.txt", offset = offset, limit = limit)
+            assertFalse(bytes.isPartial)
+            assertEquals(5, bytes.contentLength)
+            assertEquals(-1, bytes.totalSize)
+
+            mockWebServer.enqueue(MockResponse().setBody("hello"))
+            val stream = filesystemAdapter.readStreamDetailed("/data.txt", offset = offset, limit = limit)
+            stream.body.use {
+                assertFalse(stream.isPartial)
+                assertEquals(5, stream.contentLength)
+                assertEquals(-1, stream.totalSize)
+            }
+        }
+    }
+
+    @Test
     fun `readFile surfaces FILE_NOT_FOUND error code on 404 so callers can distinguish it`() {
         mockWebServer.enqueue(
             MockResponse()

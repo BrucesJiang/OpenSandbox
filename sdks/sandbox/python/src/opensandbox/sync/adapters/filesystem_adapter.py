@@ -199,7 +199,11 @@ class FilesystemAdapterSync(FilesystemSync):
                 params=request_data["params"],
             )
             response.raise_for_status()
-            return create_read_bytes_response(response, response.content)
+            return create_read_bytes_response(
+                response,
+                response.content,
+                line_based=offset is not None or limit is not None,
+            )
         except Exception as e:
             logger.error(f"Failed to read file {path}", exc_info=e)
             raise ExceptionConverter.to_sandbox_exception(e) from e
@@ -258,7 +262,9 @@ class FilesystemAdapterSync(FilesystemSync):
             )
 
         return create_read_bytes_response(
-            response, iter_response_bytes(response, chunk_size)
+            response,
+            iter_response_bytes(response, chunk_size),
+            line_based=offset is not None or limit is not None,
         )
 
     def write_files(self, entries: list[WriteEntry]) -> None:

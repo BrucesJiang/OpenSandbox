@@ -157,7 +157,11 @@ class IsolatedFilesystemAdapterSync(FilesystemSync):
 
             response = self._httpx_client.get(url, headers=headers, params=params)
             response.raise_for_status()
-            return create_read_bytes_response(response, response.content)
+            return create_read_bytes_response(
+                response,
+                response.content,
+                line_based=offset is not None or limit is not None,
+            )
         except Exception as e:
             raise ExceptionConverter.to_sandbox_exception(e) from e
 
@@ -214,7 +218,9 @@ class IsolatedFilesystemAdapterSync(FilesystemSync):
             )
 
         return create_read_bytes_response(
-            response, iter_response_bytes(response, chunk_size)
+            response,
+            iter_response_bytes(response, chunk_size),
+            line_based=offset is not None or limit is not None,
         )
 
     def write_files(self, entries: list[WriteEntry]) -> None:

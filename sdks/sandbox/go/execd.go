@@ -608,7 +608,7 @@ func (e *ExecdClient) DownloadFileResponse(ctx context.Context, remotePath strin
 		if result.ContentRange != nil {
 			result.TotalSize = result.ContentRange.Total
 		}
-	} else {
+	} else if !params.Has("offset") && !params.Has("limit") {
 		result.TotalSize = result.ContentLength
 	}
 	return result, nil

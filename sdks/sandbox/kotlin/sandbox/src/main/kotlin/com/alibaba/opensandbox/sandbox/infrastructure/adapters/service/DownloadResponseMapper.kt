@@ -39,7 +39,7 @@ private fun parseContentRange(raw: String?): ByteRange? {
     return ByteRange(start = start, end = end, total = total, raw = raw)
 }
 
-internal fun <T> Response.toReadBytesResponse(body: T): ReadBytesResponse<T> {
+internal fun <T> Response.toReadBytesResponse(body: T, lineBased: Boolean): ReadBytesResponse<T> {
     val isPartial = code == 206
     val contentLength = header("Content-Length")?.toLongOrNull()?.takeIf { it >= 0 } ?: -1
     val contentRange = if (isPartial) parseContentRange(header("Content-Range")) else null
@@ -49,7 +49,7 @@ internal fun <T> Response.toReadBytesResponse(body: T): ReadBytesResponse<T> {
         contentType = header("Content-Type"),
         contentDisposition = header("Content-Disposition"),
         contentLength = contentLength,
-        totalSize = if (isPartial) contentRange?.total ?: -1 else contentLength,
+        totalSize = if (isPartial) contentRange?.total ?: -1 else if (lineBased) -1 else contentLength,
         contentRange = contentRange,
     )
 }

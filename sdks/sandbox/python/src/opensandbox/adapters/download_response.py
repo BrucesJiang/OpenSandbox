@@ -54,7 +54,7 @@ def _parse_content_range(raw: str | None) -> ByteRange | None:
 
 
 def create_read_bytes_response(
-    response: httpx.Response, body: _BodyT
+    response: httpx.Response, body: _BodyT, *, line_based: bool
 ) -> ReadBytesResponse[_BodyT]:
     """Map an HTTP download response to the stable SDK response model."""
     content_length = _parse_header_integer(response.headers.get("content-length"))
@@ -66,7 +66,7 @@ def create_read_bytes_response(
     total_size = (
         (content_range.total if content_range is not None else -1)
         if response.status_code == 206
-        else content_length
+        else (-1 if line_based else content_length)
     )
 
     return ReadBytesResponse(

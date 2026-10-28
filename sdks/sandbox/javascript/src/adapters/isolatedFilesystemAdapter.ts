@@ -375,7 +375,11 @@ export class IsolatedFilesystemAdapter implements SandboxFiles {
   ): Promise<ReadBytesResponse<Uint8Array>> {
     const res = await this.fetchDownload(path, opts, "Download failed");
     const ab = await res.arrayBuffer();
-    return createReadBytesResponse(res, new Uint8Array(ab));
+    return createReadBytesResponse(
+      res,
+      new Uint8Array(ab),
+      opts?.offset != null || opts?.limit != null,
+    );
   }
 
   readBytesStream(
@@ -390,7 +394,11 @@ export class IsolatedFilesystemAdapter implements SandboxFiles {
     opts?: { range?: string; offset?: number; limit?: number },
   ): Promise<ReadBytesResponse<ReadBytesStream>> {
     const res = await this.fetchDownload(path, opts, "Download stream failed");
-    return createReadBytesResponse(res, readResponseBody(res));
+    return createReadBytesResponse(
+      res,
+      readResponseBody(res),
+      opts?.offset != null || opts?.limit != null,
+    );
   }
 
   private async fetchDownload(

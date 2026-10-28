@@ -220,7 +220,7 @@ internal sealed class FilesystemAdapter : IIdentitySandboxFiles
             () => BuildDownloadRequest(path, options), cancellationToken, _client.SendTransferAsync).ConfigureAwait(false);
         await _client.EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
         var body = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
-        return CreateReadBytesResponse(response, body);
+        return CreateReadBytesResponse(response, body, options);
     }
 
     public async IAsyncEnumerable<byte[]> ReadBytesStreamAsync(
@@ -255,7 +255,7 @@ internal sealed class FilesystemAdapter : IIdentitySandboxFiles
         }
 
         IAsyncReadBytesStream body = new ResponseByteStream(response, cancellationToken);
-        return CreateReadBytesResponse(response, body);
+        return CreateReadBytesResponse(response, body, options);
     }
 
     private HttpRequestMessage BuildDownloadRequest(string path, ReadBytesOptions? options)
@@ -279,10 +279,11 @@ internal sealed class FilesystemAdapter : IIdentitySandboxFiles
         return request;
     }
 
-    private static ReadBytesResponse<T> CreateReadBytesResponse<T>(HttpResponseMessage response, T body)
+    private static ReadBytesResponse<T> CreateReadBytesResponse<T>(HttpResponseMessage response, T body, ReadBytesOptions? options)
     {
         var isPartial = (int)response.StatusCode == 206;
         var contentLength = response.Content.Headers.ContentLength ?? -1;
+        var lineBased = options?.Offset != null || options?.Limit != null;
         var contentRange = isPartial ? ParseContentRange(GetContentHeader(response, "Content-Range")) : null;
         return new ReadBytesResponse<T>(
             Body: body,
@@ -290,7 +291,7 @@ internal sealed class FilesystemAdapter : IIdentitySandboxFiles
             ContentType: GetContentHeader(response, "Content-Type"),
             ContentDisposition: GetContentHeader(response, "Content-Disposition"),
             ContentLength: contentLength,
-            TotalSize: isPartial ? contentRange?.Total ?? -1 : contentLength,
+            TotalSize: isPartial ? contentRange?.Total ?? -1 : lineBased ? -1 : contentLength,
             ContentRange: contentRange);
     }
 

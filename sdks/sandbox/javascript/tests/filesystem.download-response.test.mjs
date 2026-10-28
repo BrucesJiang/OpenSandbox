@@ -180,3 +180,19 @@ test("detailed streams cancel unconsumed and partially consumed bodies", async (
   }
   assert.equal(cancelled[1], true);
 });
+
+for (const options of [{ offset: 2 }, { limit: 2 }]) {
+  test(`line reads report unknown total size: ${JSON.stringify(options)}`, async () => {
+    const adapter = createAdapter(async () =>
+      new Response("hello", { headers: { "Content-Length": "5" } }),
+    );
+    for (const method of ["readBytesDetailed", "readBytesStreamDetailed"]) {
+      const response = await adapter[method]("/data.txt", options);
+      assert.equal(response.statusCode, 200);
+      assert.equal(response.isPartial, false);
+      assert.equal(response.contentLength, 5);
+      assert.equal(response.totalSize, -1);
+      if (method === "readBytesStreamDetailed") await response.body.close();
+    }
+  });
+}

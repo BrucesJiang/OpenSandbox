@@ -227,3 +227,48 @@ def test_sync_detailed_streams_close_unconsumed_and_partial_responses() -> None:
             break
     assert streams[1].closed is True
     adapter._httpx_client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("options", [{"offset": 2}, {"limit": 2}])
+async def test_async_line_reads_report_unknown_total_size(options) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request, content=b"hello")
+
+    adapter = FilesystemAdapter(
+        ConnectionConfig(protocol="http", transport=httpx.MockTransport(handler)),
+        _endpoint(),
+    )
+    try:
+        for method in [adapter.read_bytes_detailed, adapter.read_bytes_stream_detailed]:
+            response = await method("/data.txt", **options)
+            assert response.status_code == 200
+            assert response.is_partial is False
+            assert response.content_length == 5
+            assert response.total_size == -1
+            if not isinstance(response.body, bytes):
+                await response.body.aclose()
+    finally:
+        await adapter._httpx_client.aclose()
+
+
+@pytest.mark.parametrize("options", [{"offset": 2}, {"limit": 2}])
+def test_sync_line_reads_report_unknown_total_size(options) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request, content=b"hello")
+
+    adapter = FilesystemAdapterSync(
+        ConnectionConfigSync(protocol="http", transport=httpx.MockTransport(handler)),
+        _endpoint(),
+    )
+    try:
+        for method in [adapter.read_bytes_detailed, adapter.read_bytes_stream_detailed]:
+            response = method("/data.txt", **options)
+            assert response.status_code == 200
+            assert response.is_partial is False
+            assert response.content_length == 5
+            assert response.total_size == -1
+            if not isinstance(response.body, bytes):
+                response.body.close()
+    finally:
+        adapter._httpx_client.close()

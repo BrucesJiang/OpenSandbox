@@ -157,7 +157,7 @@ internal class FilesystemAdapter(
                     }
                 }
                 val body = response.body?.bytes() ?: ByteArray(0)
-                return response.toReadBytesResponse(body)
+                return response.toReadBytesResponse(body, offset != null || limit != null)
             }
         } catch (e: Exception) {
             logReadFailure("Failed to read file as byte array: $path", e)
@@ -198,7 +198,7 @@ internal class FilesystemAdapter(
                     response.close()
                     throw IllegalStateException("Response body is null")
                 }
-            return response.toReadBytesResponse(responseBody.byteStream())
+            return response.toReadBytesResponse(responseBody.byteStream(), offset != null || limit != null)
         } catch (e: Exception) {
             logReadFailure("Failed to read file as stream: $path", e)
             throw e.toSandboxException()

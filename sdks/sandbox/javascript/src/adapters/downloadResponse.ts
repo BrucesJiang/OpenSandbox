@@ -43,6 +43,7 @@ function parseContentRange(raw: string | null): ByteRange | undefined {
 export function createReadBytesResponse<TBody>(
   response: Response,
   body: TBody,
+  lineBased: boolean,
 ): ReadBytesResponse<TBody> {
   const isPartial = response.status === 206;
   const contentRange = isPartial
@@ -56,7 +57,9 @@ export function createReadBytesResponse<TBody>(
     contentType: response.headers.get("content-type") ?? undefined,
     contentDisposition: response.headers.get("content-disposition") ?? undefined,
     contentLength,
-    totalSize: isPartial ? (contentRange?.total ?? -1) : contentLength,
+    totalSize: isPartial
+      ? (contentRange?.total ?? -1)
+      : lineBased ? -1 : contentLength,
     contentRange,
     isPartial,
   };

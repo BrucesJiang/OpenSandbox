@@ -3137,3 +3137,21 @@ func TestCreateSession_SendsCwd(t *testing.T) {
 		assert.Fail(t, fmt.Sprintf("cwd = %q, want /workspace (regression: request body was dropped)", gotCwd))
 	}
 }
+
+func TestDownloadFileResponse_LineReads(t *testing.T) {
+	for _, opts := range []DownloadFileOptions{{Offset: 2}, {Limit: 2}} {
+		t.Run(fmt.Sprintf("%+v", opts), func(t *testing.T) {
+			_, client := newExecdServer(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Length", "5")
+				_, _ = w.Write([]byte("hello"))
+			})
+			resp, err := client.DownloadFileResponse(context.Background(), "/data.txt", "", opts)
+			require.NoError(t, err)
+			defer resp.Body.Close()
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			require.Equal(t, false, resp.IsPartial())
+			require.Equal(t, int64(5), resp.ContentLength)
+			require.Equal(t, int64(-1), resp.TotalSize)
+		})
+	}
+}

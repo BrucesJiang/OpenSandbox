@@ -25,6 +25,30 @@ namespace OpenSandbox.Tests;
 
 public class FilesystemAdapterTests
 {
+    [Theory]
+    [InlineData(2, null)]
+    [InlineData(null, 2)]
+    public async Task LineReads_ShouldReportUnknownTotalSize(int? offset, int? limit)
+    {
+        var handler = new DownloadHandler();
+        handler.Enqueue(DownloadResponse(HttpStatusCode.OK, "hello"));
+        handler.Enqueue(DownloadResponse(HttpStatusCode.OK, "hello"));
+        using var client = new HttpClient(handler);
+        var adapter = CreateAdapter(client);
+        var options = new ReadBytesOptions { Offset = offset, Limit = limit };
+
+        var bytes = await adapter.ReadBytesDetailedAsync("/data.txt", options);
+        bytes.IsPartial.Should().BeFalse();
+        bytes.ContentLength.Should().Be(5);
+        bytes.TotalSize.Should().Be(-1);
+
+        var stream = await adapter.ReadBytesStreamDetailedAsync("/data.txt", options);
+        await using var body = stream.Body;
+        stream.IsPartial.Should().BeFalse();
+        stream.ContentLength.Should().Be(5);
+        stream.TotalSize.Should().Be(-1);
+    }
+
     [Fact]
     public async Task WithIdentity_ShouldScopeJsonAndBinaryRequestsWithoutMutatingOriginal()
     {
