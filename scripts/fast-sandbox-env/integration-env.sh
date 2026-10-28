@@ -1987,11 +1987,17 @@ if ! "$tools/overlaybd-create" --hybrid "$d/data" "$d/index" 1 >/dev/null 2>&1; 
 fi
 printf '{"lowers":[],"upper":{"index":"%s","data":"%s","vsize":1},"resultFile":"%s"}' \
 	"$d/index" "$d/data" "$d/result" > "$d/config.json"
-reply=$(curl -sS -m 120 --noproxy '*' --unix-socket "$sock" -w '\n%{httpcode}' \
+# No --fail: a daemon rejection still carries the JSON error body this
+# probe classifies on; no --write-out either (older curl builds reject
+# %{httpcode}, which once turned a real wedge into a false
+# "inconclusive"). Only a transport failure lands in the if branch.
+if ! body=$(curl -sS -m 120 --noproxy '*' --unix-socket "$sock" \
 	-X POST -H 'Content-Type: application/json' \
-	-d "{\"config\":\"$d/config.json\"}" http://ublkd/v1/add 2>&1)
-code=$(printf '%s\n' "$reply" | tail -n 1)
-body=$(printf '%s\n' "$reply" | sed '$d')
+	-d "{\"config\":\"$d/config.json\"}" http://ublkd/v1/add 2>&1); then
+	echo "PROBE_RESULT=inconclusive"
+	printf '%s\n' "$body"
+	exit 0
+fi
 case "$body" in
 *'"ok":true'*)
 	# add succeeded: release the probe device before it leaks — a leaked
@@ -2013,7 +2019,6 @@ case "$body" in
 	;;
 *)
 	echo "PROBE_RESULT=inconclusive"
-	echo "http=$code"
 	printf '%s\n' "$body"
 	;;
 esac
@@ -2021,14 +2026,21 @@ PROBE
 }
 
 ublk_heal_wedge() {
-	log "heal: recycling the host ublk module (nothing holds it while the stack is up; leaked devices die with it)"
+	log "heal: recycling the host ublk module (leaked devices die with it)"
+	# The sidecar daemons hold /dev/ublk-control open, which pins the
+	# module against modprobe -r: drop the runtime pods first. The
+	# DaemonSet rebuilds its pods on its own; rollout status waits for
+	# them. If a rebuilding daemon re-opens the control node before the
+	# unload lands, the recycle is a no-op and the re-probe below fails
+	# with the explicit reboot guidance.
+	kubectl -n "$NS" delete pod -l component=firecracker-runtime --now --timeout=90s >/dev/null 2>&1 || true
+	sleep 3
 	sudo_ modprobe -r ublk_drv 2>/dev/null || true
 	sudo_ modprobe ublk_drv 2>/dev/null || true
 	grep -qiE 'ublk-char|ublkc' /proc/devices \
 		|| die "ublk module did not register after the recycle: the runner host needs a reboot to clear the wedged ublk state"
-	log "heal: restarting daemonset/firecracker-runtime (sidecars must reopen the fresh control node)"
-	kubectl -n "$NS" rollout restart daemonset/firecracker-runtime >/dev/null
 	kubectl -n "$NS" rollout status daemonset/firecracker-runtime --timeout=300s >/dev/null
+	log "heal: runtime pods rebuilt on the fresh module"
 }
 
 ublk_probe_or_heal() {
@@ -3572,19 +3584,22 @@ down() {
 	stateroot_scrub
 	# OCI_STACK=1: the kernel ublk module outlives the cluster, and a run
 	# killed mid-add leaves devices behind with no daemon to release them.
-	# One leaked device wedges every later `ublkd add` ("device failed to
-	# start") on every node of the next run. Nothing holds the module at
-	# this point, so recycle it whenever the device table is not empty;
-	# listing the leftovers first keeps the log actionable.
+	# On the Al8 6.6 backport ublk registers NO block major — every device
+	# consumes one of a fixed 64 char minors (host /dev/ublkc0..63, major
+	# 235, devtmpfs-created) — so the leak surfaces there, and once all
+	# 64 minors are gone every later `ublkd add` fails with "device
+	# failed to start" (observed on the nightly runner: a full pool
+	# accumulated over several days). Nothing holds the module at this
+	# point, so recycle it whenever leftover nodes exist.
 	if [[ "$OCI_STACK" == 1 ]]; then
 		local ublk_leftovers
 		ublk_leftovers="$(
 			{
-				awk 'NR > 1 && $4 ~ /^ublkb/ {printf "%s ", $4}' /proc/partitions 2>/dev/null || true
-				ls -A /sys/block 2>/dev/null | grep -o '^ublkb[0-9]*' 2>/dev/null | tr '\n' ' ' || true
-			} | tr -s ' ')"
+				ls -A /dev 2>/dev/null | grep -E '^ublkc[0-9]+$' || true
+				ls -A /sys/block 2>/dev/null | grep -E '^ublkb[0-9]+$' || true
+			} | tr '\n' ' ' | tr -s ' ')"
 		if [[ -n "$ublk_leftovers" ]]; then
-			log "releasing orphan ublk devices left by this run: $ublk_leftovers"
+			log "releasing orphan ublk devices left by this run ($(printf '%s\n' "$ublk_leftovers" | wc -w) node(s)): $ublk_leftovers"
 			sudo_ modprobe -r ublk_drv 2>/dev/null \
 				|| log "WARNING: modprobe -r ublk_drv failed (module busy?); the next run's ublk probe will retry the heal"
 			sudo_ modprobe ublk_drv 2>/dev/null || true
