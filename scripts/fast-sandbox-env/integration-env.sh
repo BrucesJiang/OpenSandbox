@@ -379,11 +379,42 @@ failure_dump() {
 		kubectl get pods -n "$NS" -o wide 2>&1 || true
 		echo "--- controller logs (tail) ---"
 		kubectl logs -n "$NS" deploy/fast-sandbox-controller --tail=80 2>&1 || true
-		echo "--- firecracker-runtime logs (tail) ---"
-		kubectl logs -n "$NS" daemonset/firecracker-runtime --all-containers --tail=80 2>&1 || true
-		# --all-containers: the label selector alone logs only the first
-		# container and drops egress. Deep tail: failure loops flood the
-		# window and bury the pre-incident history.
+		echo "--- firecracker-runtime logs (every pod + container, tail) ---"
+		# `kubectl logs daemonset/...` resolves to ONE pod only, so a wedged
+		# ublkd on the other node stays invisible. Loop the pods instead,
+		# and add the ublkd audit log plus the kernel device table: the
+		# daemon reports device-start failures to the audit log, not to
+		# stdout ("device failed to start (see daemon log)").
+		local rpod rcontainer
+		for rpod in $(runtime_pods 2>/dev/null || true); do
+			for rcontainer in $(kubectl -n "$NS" get pod "$rpod" -o jsonpath='{.spec.containers[*].name}' 2>/dev/null); do
+				echo "### $rpod container=$rcontainer"
+				kubectl logs -n "$NS" "$rpod" -c "$rcontainer" --tail=80 2>&1 || true
+			done
+			echo "### $rpod overlaybd-ublkd audit log + kernel ublk state"
+			kubectl exec -n "$NS" "$rpod" -c overlaybd-ublkd -- sh -c '
+				tail -100 /var/log/overlaybd-audit.log 2>/dev/null
+				echo "-- /dev/ublk*:"
+				ls -la /dev/ublk* 2>&1
+				echo "-- /proc/devices (ublk):"
+				grep -i ublk /proc/devices 2>&1
+				echo "-- ublkd attached devices, attributed by owner (the daemon list is the only record that outlives a dead builder/fastlet pod):"
+				list=$(curl -sS -m 10 --noproxy "*" --unix-socket /run/fast-sandbox/overlaybd/ublkd.sock http://ublkd/v1/list 2>&1)
+				printf "%s\n" "$list" | tr "{," "\n" | grep -o "\"config\":\"[^\"]*\"" | sed "s/^\"config\":\"//;s/\"\$//" | sort > /tmp/fsb-dev-configs.$$
+				builder=0; shared=0; sandbox=0; other=0
+				while read -r cfg; do
+					[ -n "$cfg" ] || continue
+					case "$cfg" in
+					/build/*) builder=$((builder+1)); tag=builder ;;
+					*.snapfiles/*) shared=$((shared+1)); tag=fastlet-shared ;;
+					*/sandboxes/*) sandbox=$((sandbox+1)); tag=fastlet-sandbox ;;
+					*) other=$((other+1)); tag=other ;;
+					esac
+					echo "    [$tag] $cfg"
+				done < /tmp/fsb-dev-configs.$$
+				echo "   summary: builder=$builder fastlet-shared=$shared fastlet-sandbox=$sandbox other=$other"
+				rm -f /tmp/fsb-dev-configs.$$' 2>&1 || true
+		done
 		echo "--- fastlet pod logs, every container (deep tail) ---"
 		kubectl logs -n "$RESOURCE_NS" -l app=sandbox-fastlet \
 			--all-containers --prefix --timestamps --tail=15000 2>&1 || true
@@ -1939,6 +1970,175 @@ ublk_module_up() {
 	pass "ublk module registered"
 }
 
+# --- stage: real ublk add/del probe + wedge self-heal (OCI_STACK=1) --------------
+
+# Registration in /proc/devices is necessary but not sufficient: a run
+# killed mid-add leaks kernel ublk devices that outlive the kind cluster
+# (the module is never reloaded), and one leaked device wedges every later
+# `ublkd add` with the daemon's "device failed to start" — surfacing only
+# ~16 minutes into the overlaybd template build. This probe drives the same
+# daemon -> kernel path the build uses (POST /v1/add, then POST /v1/del on
+# the node ublkd's control socket) with a minimal upper-only device, so a
+# wedge surfaces in seconds and the heal below clears it automatically.
+#
+# The probe runs inside each node's overlaybd-ublkd sidecar: that container
+# holds both the control socket and the overlaybd tooling, so the device
+# created is exactly the kind a template build creates.
+ublk_probe_once() { # pod -> prints PROBE_RESULT=<class> first, details after
+	local pod="$1"
+	kubectl exec -i -n "$NS" "$pod" -c overlaybd-ublkd -- sh -s <<'PROBE' 2>&1 || true
+sock=/run/fast-sandbox/overlaybd/ublkd.sock
+tools=/opt/fast-sandbox/oci/current/bin
+if ! ping=$(curl -sS -m 5 --noproxy '*' --unix-socket "$sock" http://ublkd/v1/ping 2>&1); then
+	echo "PROBE_RESULT=ping-failed"
+	printf '%s\n' "$ping"
+	exit 0
+fi
+d=$(mktemp -d /tmp/fsb-ublk-probe.XXXXXX) || { echo "PROBE_RESULT=inconclusive"; echo "mktemp failed"; exit 0; }
+trap 'rm -rf "$d"' EXIT
+if ! "$tools/overlaybd-create" --hybrid "$d/data" "$d/index" 1 >/dev/null 2>&1; then
+	echo "PROBE_RESULT=inconclusive"
+	echo "overlaybd-create --hybrid failed"
+	exit 0
+fi
+printf '{"lowers":[],"upper":{"index":"%s","data":"%s","vsize":1},"resultFile":"%s"}' \
+	"$d/index" "$d/data" "$d/result" > "$d/config.json"
+# No --fail: a daemon rejection still carries the JSON error body this
+# probe classifies on; no --write-out either (older curl builds reject
+# %{httpcode}, which once turned a real wedge into a false
+# "inconclusive"). Only a transport failure lands in the if branch.
+if ! body=$(curl -sS -m 120 --noproxy '*' --unix-socket "$sock" \
+	-X POST -H 'Content-Type: application/json' \
+	-d "{\"config\":\"$d/config.json\"}" http://ublkd/v1/add 2>&1); then
+	echo "PROBE_RESULT=inconclusive"
+	printf '%s\n' "$body"
+	exit 0
+fi
+case "$body" in
+*'"ok":true'*)
+	# add succeeded: release the probe device before it leaks — a leaked
+	# probe device would wedge the very next add, so a del that is not
+	# explicitly acknowledged by the daemon is reported as wedged (the
+	# heal recycles the module and clears the leak). curl without --fail
+	# exits 0 on a daemon rejection too, so the response BODY decides.
+	dev_id=$(printf '%s' "$body" | tr '{,' '\n\n' | grep -o '"dev_id":[0-9]*' | head -1 | tr -cd '0-9')
+	if [ -z "$dev_id" ]; then
+		echo "PROBE_RESULT=inconclusive"
+		echo "add reply carried no dev_id"
+		printf '%s\n' "$body"
+		exit 0
+	fi
+	if ! del_reply=$(curl -sS -m 30 --noproxy '*' --unix-socket "$sock" \
+		-X POST -H 'Content-Type: application/json' \
+		-d "{\"dev_id\":$dev_id}" http://ublkd/v1/del 2>&1); then
+		del_reply="transport failure: $del_reply"
+	fi
+	case "$del_reply" in
+	*'"ok":true'*)
+		echo "PROBE_RESULT=ok dev_id=$dev_id"
+		;;
+	*)
+		echo "PROBE_RESULT=wedged"
+		echo "add succeeded but the probe device release failed (dev_id=$dev_id): $del_reply"
+		;;
+	esac
+	;;
+*"device failed to start"*)
+	echo "PROBE_RESULT=wedged"
+	printf '%s\n' "$body"
+	;;
+*)
+	echo "PROBE_RESULT=inconclusive"
+	printf '%s\n' "$body"
+	;;
+esac
+PROBE
+}
+
+ublk_heal_wedge() {
+	log "heal: recycling the host ublk module (leaked devices die with it)"
+	# The sidecar daemons hold /dev/ublk-control open, which pins the
+	# module against modprobe -r: drop the runtime pods first. The
+	# DaemonSet starts replacements right away, but they stay in
+	# scheduling/init for a few seconds before any daemon re-opens the
+	# control node — so retry the unload across that window. Success
+	# proves no process held it; every later open lands on the fresh
+	# module. A failed recycle is not fatal here: the re-probe decides,
+	# and its failure carries the explicit reboot guidance.
+	kubectl -n "$NS" delete pod -l component=firecracker-runtime --now --timeout=90s >/dev/null 2>&1 || true
+	local attempt unloaded=0
+	for attempt in 1 2 3 4 5; do
+		if sudo_ modprobe -r ublk_drv 2>/dev/null; then unloaded=1; break; fi
+		sleep 2
+	done
+	sudo_ modprobe ublk_drv 2>/dev/null || true
+	grep -qiE 'ublk-char|ublkc' /proc/devices \
+		|| die "ublk module did not register after the recycle: the runner host needs a reboot to clear the wedged ublk state"
+	if [[ "$unloaded" == 1 ]]; then
+		log "heal: ublk module recycled clean on attempt ${attempt}"
+	else
+		log "heal: modprobe -r stayed busy (a daemon re-opened the control node first); the re-probe will tell"
+	fi
+	kubectl -n "$NS" rollout status daemonset/firecracker-runtime --timeout=300s >/dev/null
+	log "heal: runtime pods ready"
+}
+
+ublk_probe_or_heal() {
+	[[ "$OCI_STACK" == 1 ]] || { log "OCI_STACK=0: skipping the ublk probe (overlaybd disabled)"; return 0; }
+	local pods pod result detail healed recheck reok
+	pods="$(runtime_pods 2>/dev/null || true)"
+	[[ -n "$pods" ]] || die "no firecracker-runtime pods to probe (run up first)"
+	healed=0
+	for pod in $pods; do
+		detail="$(ublk_probe_once "$pod")"
+		result="$(printf '%s\n' "$detail" | awk '/^PROBE_RESULT=/ && !found {sub(/^PROBE_RESULT=/, ""); print; found=1}')"
+		case "$result" in
+		ok*)
+			pass "ublk probe ok on ${pod}: node-side add/del through the real daemon -> kernel path"
+			;;
+		wedged)
+			printf '%s\n' "$detail" | sed 's/^/[fast-sandbox-env]     /' >&2
+			if [[ "$healed" == 1 ]]; then
+				fail "ublk probe still wedged on ${pod} after the heal: the runner host's ublk state needs a reboot to recover"
+			fi
+			log "ublk probe WEDGED on ${pod}: the daemon cannot start devices; healing"
+			ublk_heal_wedge
+			healed=1
+			reok=1
+			# The heal deleted the pods; the DaemonSet recreated them under
+			# new names, so re-query before the re-probe — the stale list
+			# would NotFound on every pod and fail a healthy recovery.
+			pods="$(runtime_pods 2>/dev/null || true)"
+			[[ -n "$pods" ]] || fail "no firecracker-runtime pods after the heal"
+			# The restart reset every daemon, so re-probe all pods.
+			for recheck in $pods; do
+				detail="$(ublk_probe_once "$recheck")"
+				result="$(printf '%s\n' "$detail" | awk '/^PROBE_RESULT=/ && !found {sub(/^PROBE_RESULT=/, ""); print; found=1}')"
+				if [[ "$result" == ok* ]]; then
+					pass "ublk probe ok after heal on ${recheck}"
+				else
+					reok=0
+					log "ublk probe after heal on ${recheck}: ${result:-no-result}"
+					printf '%s\n' "$detail" | sed 's/^/[fast-sandbox-env]     /' >&2
+				fi
+			done
+			[[ "$reok" == 1 ]] || fail "ublk probe still unhealthy after the heal (probe output above)"
+			;;
+		ping-failed)
+			printf '%s\n' "$detail" | sed 's/^/[fast-sandbox-env]     /' >&2
+			fail "ublk probe: the daemon on ${pod} is unreachable on its control socket (runtime not healthy)"
+			;;
+		*)
+			# An unexpected add response means the probe config hit a
+			# validation path, not the kernel wedge; never block a
+			# working stack on it — the build reports the real error.
+			log "WARNING: ublk probe inconclusive on ${pod} (result: ${result:-none}); continuing"
+			printf '%s\n' "$detail" | sed 's/^/[fast-sandbox-env]     /' >&2
+			;;
+		esac
+	done
+}
+
 render_pool() { # > $GEN_DIR/firecracker-egress-pool.yaml
 	local src="$MANIFESTS_DIR/pool/firecracker-egress-pool.yaml" out="$GEN_DIR/firecracker-egress-pool.yaml"
 	mkdir -p "$GEN_DIR"
@@ -3280,6 +3480,9 @@ verify_overlaybd() {
 		log "OCI_STACK=0: overlaybd disabled; nothing to verify"
 		return 0
 	}
+	# Probe before building: a wedged host ublk table kills the template
+	# build ~16 minutes in; the probe fails in seconds and heals itself.
+	run_stage "ublk add/del probe (node daemon -> kernel path)" ublk_probe_or_heal
 	run_stage "SandboxTemplate build (overlaybd, oci:// publication)" template_up_overlaybd
 	run_stage "end-to-end verify (overlaybd template)" opensandbox_verify "$OCI_TEMPLATE_ID"
 	run_stage "pause/resume verify (overlaybd template)" pause_resume_verify "$OCI_TEMPLATE_ID"
@@ -3424,6 +3627,31 @@ down() {
 	# A committed DART cache is FINAL (never refreshed): purge it, or a
 	# rebuilt SandboxTemplate stays ignored when the StateRoot survives.
 	stateroot_scrub
+	# OCI_STACK=1: the kernel ublk module outlives the cluster, and a run
+	# killed mid-add leaves devices behind with no daemon to release them.
+	# On the Al8 6.6 backport ublk registers NO block major — every device
+	# consumes one of a fixed 64 char minors (host /dev/ublkc0..63, major
+	# 235, devtmpfs-created) — so the leak surfaces there, and once all
+	# 64 minors are gone every later `ublkd add` fails with "device
+	# failed to start" (observed on the nightly runner: a full pool
+	# accumulated over several days). Nothing holds the module at this
+	# point, so recycle it whenever leftover nodes exist.
+	if [[ "$OCI_STACK" == 1 ]]; then
+		local ublk_leftovers
+		ublk_leftovers="$(
+			{
+				ls -A /dev 2>/dev/null | grep -E '^ublkc[0-9]+$' || true
+				ls -A /sys/block 2>/dev/null | grep -E '^ublkb[0-9]+$' || true
+			} | tr '\n' ' ' | tr -s ' ')"
+		if [[ -n "$ublk_leftovers" ]]; then
+			log "releasing orphan ublk devices left by this run ($(printf '%s\n' "$ublk_leftovers" | wc -w) node(s)): $ublk_leftovers"
+			sudo_ modprobe -r ublk_drv 2>/dev/null \
+				|| log "WARNING: modprobe -r ublk_drv failed (module busy?); the next run's ublk probe will retry the heal"
+			sudo_ modprobe ublk_drv 2>/dev/null || true
+			grep -qiE 'ublk-char|ublkc' /proc/devices \
+				|| log "WARNING: ublk not registered after the recycle; the next run's up will modprobe it"
+		fi
+	fi
 	pass "host cleanup complete"
 }
 
