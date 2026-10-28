@@ -644,7 +644,7 @@ def test_routes_template_lifecycle(client, crs, service):
     assert detail.json()["status"]["manifestRef"] == "s3://b/m"
     assert detail.json()["env"] == {"LOG_LEVEL": "info"}
 
-    listing = client.get("/v1/templates", params={"metadata": "origin%3Dtest"})
+    listing = client.get("/v1/templates", params={"metadata": "origin=test"})
     assert listing.status_code == 200
     payload = listing.json()
     assert payload["pagination"]["totalItems"] == 1
@@ -653,6 +653,17 @@ def test_routes_template_lifecycle(client, crs, service):
     deleted = client.delete(f"/v1/templates/{template_id}")
     assert deleted.status_code == 204
     assert client.get(f"/v1/templates/{template_id}").status_code == 404
+
+
+def test_routes_list_filters_on_empty_metadata_value(client, service):
+    empty = service.create_template(_create_request(metadata={"env": ""}))
+    service.create_template(_create_request(metadata={"env": "prod"}))
+
+    listing = client.get("/v1/templates", params={"metadata": "env="})
+    assert listing.status_code == 200, listing.text
+    payload = listing.json()
+    assert payload["pagination"]["totalItems"] == 1
+    assert [item["templateId"] for item in payload["items"]] == [empty.template_id]
 
 
 def test_routes_reject_extra_fields(client):
