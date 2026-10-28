@@ -147,6 +147,7 @@ func (s *fastSandboxPolicyServer) handleActionsV2Status(w http.ResponseWriter, r
 	resp := s.actionStatusResponse()
 	resp.APIVersion = constants.ActionsAPIVersionV2
 	resp.OwnerStatus = true
+	resp.VaultTransfer, resp.PolicyTransfer, resp.TemplateStateExport = false, false, false
 	writeJSON(w, http.StatusOK, resp)
 }
 

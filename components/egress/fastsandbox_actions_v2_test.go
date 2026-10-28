@@ -109,6 +109,9 @@ func TestActionsV2IsOptInAndDoesNotMountLegacyMutationRoutes(t *testing.T) {
 	require.NoError(t, json.Unmarshal(status.Body.Bytes(), &response))
 	require.Equal(t, actionhandler.APIVersionV2, response.APIVersion)
 	require.True(t, response.OwnerStatus)
+	require.False(t, response.VaultTransfer)
+	require.False(t, response.PolicyTransfer)
+	require.False(t, response.TemplateStateExport)
 }
 
 func TestActionsV2SeparatesSubjectsAndFencesOwnerChanges(t *testing.T) {
