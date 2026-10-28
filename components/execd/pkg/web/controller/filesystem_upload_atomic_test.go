@@ -17,6 +17,7 @@ package controller
 import (
 	"bytes"
 	"errors"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -25,8 +26,24 @@ import (
 	"testing"
 	"testing/iotest"
 
+	"github.com/alibaba/opensandbox/execd/pkg/vfs"
 	"github.com/stretchr/testify/require"
 )
+
+type uploadObservingReader func([]byte) (int, error)
+
+func (f uploadObservingReader) Read(p []byte) (int, error) {
+	return f(p)
+}
+
+type uploadListingFS struct {
+	vfs.FS
+	entries []os.DirEntry
+}
+
+func (f uploadListingFS) ReadDir(string) ([]os.DirEntry, error) {
+	return f.entries, nil
+}
 
 // requireNoUploadStaging asserts the staging file of a failed upload is gone.
 func requireNoUploadStaging(t *testing.T, dir string) {
@@ -106,6 +123,42 @@ func TestWriteUploadStreamPreservesDestinationMode(t *testing.T) {
 	require.Equal(t, os.FileMode(0o640), info.Mode().Perm())
 }
 
+// Replacing a restrictive file must not expose or let a co-tenant modify the
+// in-flight content through the staging file's default permissions.
+func TestWriteUploadStreamStagesRestrictiveDestinationPrivately(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not model Unix permission bits")
+	}
+	dir := t.TempDir()
+	target := filepath.Join(dir, "secret.txt")
+	require.NoError(t, os.WriteFile(target, []byte("old"), 0o600))
+
+	var stagingPerm os.FileMode
+	found := false
+	uerr := writeUploadStream(target, uploadObservingReader(func(p []byte) (int, error) {
+		entries, err := os.ReadDir(dir)
+		require.NoError(t, err)
+		for _, entry := range entries {
+			if !isUploadStagingName(entry.Name()) {
+				continue
+			}
+			info, err := entry.Info()
+			require.NoError(t, err)
+			stagingPerm = info.Mode().Perm()
+			found = true
+			break
+		}
+		return copy(p, []byte("new")), io.EOF
+	}))
+
+	require.Nil(t, uerr)
+	require.True(t, found, "upload did not create a staging file before reading content")
+	require.Equal(t, os.FileMode(0o600), stagingPerm)
+	info, err := os.Stat(target)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+}
+
 // A destination that cannot be written keeps failing: the rename alone would
 // only need a writable directory.
 func TestWriteUploadStreamRejectsReadOnlyDestination(t *testing.T) {
@@ -161,6 +214,67 @@ func TestWriteUploadStreamFollowsSymlinkTarget(t *testing.T) {
 	got, err := os.ReadFile(realFile)
 	require.NoError(t, err)
 	require.Equal(t, "through the link", string(got))
+}
+
+func TestResolveUploadTargetPathRejectsSymlinkLoop(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first")
+	second := filepath.Join(dir, "second")
+	if err := os.Symlink("second", first); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Symlink("first", second); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	resolved, uerr := resolveUploadTargetPath(first)
+
+	require.Empty(t, resolved)
+	require.NotNil(t, uerr)
+	require.Contains(t, uerr.message, "too many levels of symbolic links")
+}
+
+// A dangling final-component link keeps the old O_CREATE behavior: the upload
+// creates the link target and leaves the link itself in place.
+func TestWriteUploadStreamCreatesDanglingSymlinkTarget(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "created.txt")
+	link := filepath.Join(dir, "dangling")
+	if err := os.Symlink(filepath.Base(target), link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	uerr := writeUploadStream(link, bytes.NewReader([]byte("through the link")))
+
+	require.Nil(t, uerr)
+	info, err := os.Lstat(link)
+	require.NoError(t, err)
+	require.NotZero(t, info.Mode()&os.ModeSymlink, "the dangling symlink must survive the upload")
+	got, err := os.ReadFile(target)
+	require.NoError(t, err)
+	require.Equal(t, "through the link", string(got))
+}
+
+func TestIsUploadStagingName(t *testing.T) {
+	require.True(t, isUploadStagingName(uploadTempPattern+"0123456789abcdef"))
+	require.False(t, isUploadStagingName(uploadTempPattern+"not-a-valid-name"))
+	require.False(t, isUploadStagingName("notes.md"))
+}
+
+func TestListIsolatedDirHidesUploadStaging(t *testing.T) {
+	dir := t.TempDir()
+	visible := filepath.Join(dir, "visible.txt")
+	require.NoError(t, os.WriteFile(visible, []byte("visible"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, uploadTempPattern+"0123456789abcdef"), []byte("in flight"), 0o600))
+	dirEntries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+
+	ctrl := &IsolatedSessionController{}
+	entries, err := ctrl.listIsolatedDir(uploadListingFS{entries: dirEntries}, ".", 1)
+
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, filepath.Base(visible), entries[0].Path)
 }
 
 // The multipart entry point keeps honoring the metadata path and mode.

@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -181,7 +182,8 @@ func writeUploadFile(resolvedPath string, fileHeader *multipart.FileHeader) *upl
 }
 
 // uploadTempPattern prefixes the staging file an upload writes next to its
-// destination. The leading dot keeps it out of a plain directory listing.
+// destination. The filesystem APIs hide these names while the file is in
+// flight or after a crash leaves one behind.
 const uploadTempPattern = ".osb-upload-"
 
 // maxUploadSymlinkDepth bounds the final-component symlink walk; it mirrors the
@@ -231,7 +233,14 @@ func writeUploadStream(target string, r io.Reader) *uploadError {
 		)
 	}
 
-	tmp, err := createUploadTemp(filepath.Dir(resolvedTarget))
+	stagingPerm := os.FileMode(os.ModePerm)
+	if statErr == nil {
+		// The destination mode is applied before the rename. Keep the content
+		// private while it is being copied instead of exposing it through the
+		// staging file's default mode.
+		stagingPerm = 0o600
+	}
+	tmp, err := createUploadTemp(filepath.Dir(resolvedTarget), stagingPerm)
 	if err != nil {
 		// A directory that is only traversable (0555, or a 0666 file in it) was
 		// writable in place before staging existed. Keep that upload working
@@ -331,17 +340,30 @@ func uploadWriteError(path string, err error) *uploadError {
 	)
 }
 
-// createUploadTemp creates the staging file with the mode a plain create in
-// this directory has today (os.ModePerm masked by the umask), so a client that
-// sends no permission keeps the mode it used to get.
-func createUploadTemp(dir string) (*os.File, error) {
+// isUploadStagingName reports whether name is one of execd's upload staging
+// files. The listing and search paths skip these so an in-flight upload, or a
+// stage left by a killed daemon, is not returned as a user file.
+func isUploadStagingName(name string) bool {
+	suffix, ok := strings.CutPrefix(name, uploadTempPattern)
+	if !ok || len(suffix) != 16 {
+		return false
+	}
+	_, err := hex.DecodeString(suffix)
+	return err == nil
+}
+
+// createUploadTemp creates the staging file with perm. A new destination keeps
+// the mode a plain create in this directory has today (os.ModePerm masked by
+// the umask); replacing an existing file starts at 0600 until its mode is
+// restored before the rename.
+func createUploadTemp(dir string, perm os.FileMode) (*os.File, error) {
 	var suffix [8]byte
 	for attempt := 0; attempt < 10; attempt++ {
 		if _, err := rand.Read(suffix[:]); err != nil {
 			return nil, err
 		}
 		name := filepath.Join(dir, uploadTempPattern+hex.EncodeToString(suffix[:]))
-		f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, os.ModePerm)
+		f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
 		if err == nil {
 			return f, nil
 		}
