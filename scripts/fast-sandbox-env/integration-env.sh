@@ -2001,17 +2001,31 @@ fi
 case "$body" in
 *'"ok":true'*)
 	# add succeeded: release the probe device before it leaks — a leaked
-	# probe device would wedge the very next add, so a failed del is
-	# reported as wedged (the heal recycles the module and clears it).
+	# probe device would wedge the very next add, so a del that is not
+	# explicitly acknowledged by the daemon is reported as wedged (the
+	# heal recycles the module and clears the leak). curl without --fail
+	# exits 0 on a daemon rejection too, so the response BODY decides.
 	dev_id=$(printf '%s' "$body" | tr '{,' '\n\n' | grep -o '"dev_id":[0-9]*' | head -1 | tr -cd '0-9')
-	if [ -n "$dev_id" ] && curl -sS -m 30 --noproxy '*' --unix-socket "$sock" \
-		-X POST -H 'Content-Type: application/json' \
-		-d "{\"dev_id\":$dev_id}" http://ublkd/v1/del >/dev/null 2>&1; then
-		echo "PROBE_RESULT=ok dev_id=$dev_id"
-	else
-		echo "PROBE_RESULT=wedged"
-		echo "add succeeded but del failed (dev_id=$dev_id)"
+	if [ -z "$dev_id" ]; then
+		echo "PROBE_RESULT=inconclusive"
+		echo "add reply carried no dev_id"
+		printf '%s\n' "$body"
+		exit 0
 	fi
+	if ! del_reply=$(curl -sS -m 30 --noproxy '*' --unix-socket "$sock" \
+		-X POST -H 'Content-Type: application/json' \
+		-d "{\"dev_id\":$dev_id}" http://ublkd/v1/del 2>&1); then
+		del_reply="transport failure: $del_reply"
+	fi
+	case "$del_reply" in
+	*'"ok":true'*)
+		echo "PROBE_RESULT=ok dev_id=$dev_id"
+		;;
+	*)
+		echo "PROBE_RESULT=wedged"
+		echo "add succeeded but the probe device release failed (dev_id=$dev_id): $del_reply"
+		;;
+	esac
 	;;
 *"device failed to start"*)
 	echo "PROBE_RESULT=wedged"
@@ -2075,6 +2089,11 @@ ublk_probe_or_heal() {
 			ublk_heal_wedge
 			healed=1
 			reok=1
+			# The heal deleted the pods; the DaemonSet recreated them under
+			# new names, so re-query before the re-probe — the stale list
+			# would NotFound on every pod and fail a healthy recovery.
+			pods="$(runtime_pods 2>/dev/null || true)"
+			[[ -n "$pods" ]] || fail "no firecracker-runtime pods after the heal"
 			# The restart reset every daemon, so re-probe all pods.
 			for recheck in $pods; do
 				detail="$(ublk_probe_once "$recheck")"
