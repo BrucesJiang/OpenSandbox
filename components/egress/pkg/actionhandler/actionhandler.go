@@ -204,6 +204,7 @@ func (b *Binding) InputString() (string, error) {
 
 // Envelope is the full request body of POST /_fastlet/v1/actions.
 type Envelope struct {
+	Mode         string            `json:"mode,omitempty"`
 	APIVersion   string            `json:"apiVersion"`
 	Operation    Operation         `json:"operation"`
 	InvocationID string            `json:"invocationId"`
@@ -252,6 +253,9 @@ func (e *Envelope) ValidateVersion(version string) error {
 		return fmt.Errorf("sandbox.uid is required")
 	}
 	if version == APIVersionV2 {
+		if e.Mode != "legacy" {
+			return fmt.Errorf("Actions v2 requires explicit legacy mode; other modes are unsupported")
+		}
 		if e.Owner == nil || !e.Owner.Valid() || e.Owner.SandboxUID != e.Sandbox.UID ||
 			e.Owner.RuntimeInstanceID != e.Revision.RuntimeInstanceID || e.Owner.AttachmentID != e.Revision.AttachmentID ||
 			uint64(e.Owner.RouteGeneration) != e.Revision.RouteGeneration {

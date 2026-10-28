@@ -1,16 +1,33 @@
+// Copyright 2026 The OpenSandbox Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package main
 
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/alibaba/opensandbox/egress/pkg/actionhandler"
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
+	"github.com/alibaba/opensandbox/egress/pkg/policy"
 	"github.com/alibaba/opensandbox/egress/pkg/subject"
 	"github.com/stretchr/testify/require"
 )
@@ -25,6 +42,7 @@ func actionsV2Owner(uid, runtimeID, attachmentID string, generation int64) actio
 func actionsV2Body(t *testing.T, operation actionhandler.Operation, owner actionhandler.Owner, input *string) string {
 	t.Helper()
 	env := actionhandler.Envelope{
+		Mode:       "legacy",
 		APIVersion: actionhandler.APIVersionV2, Operation: operation, InvocationID: "v2-test",
 		Sandbox: actionhandler.SandboxRef{UID: owner.SandboxUID}, Owner: &owner,
 		Revision: actionhandler.Revision{SpecGeneration: 1, RuntimeInstanceID: owner.RuntimeInstanceID, AttachmentID: owner.AttachmentID, RouteGeneration: uint64(owner.RouteGeneration)},
@@ -123,7 +141,7 @@ func TestActionsV2SeparatesSubjectsAndFencesOwnerChanges(t *testing.T) {
 	require.True(t, gotB.Matches(b))
 
 	newOwnerABody := actionsV2Body(t, actionhandler.OperationSetBinding, newOwnerA, policyInput)
-	require.Equal(t, http.StatusOK, doActionsV2(t, srv, newOwnerABody).Code)
+	require.Equal(t, http.StatusConflict, doActionsV2(t, srv, newOwnerABody).Code, "strict rebind requires a new Sandbox UID")
 }
 
 func TestActionsV2RejectsSnapshotAndRelayPathOwnerMismatchBeforeEffects(t *testing.T) {
@@ -135,6 +153,7 @@ func TestActionsV2RejectsSnapshotAndRelayPathOwnerMismatchBeforeEffects(t *testi
 	require.True(t, registeredBefore)
 	beforeDeny := len(nft.denyFirst)
 	snapshot, err := json.Marshal(actionhandler.Envelope{
+		Mode:       "legacy",
 		APIVersion: actionhandler.APIVersionV2, Operation: actionhandler.OperationVaultExport, InvocationID: "snap",
 		Sandbox: actionhandler.SandboxRef{UID: "a"}, Revision: actionhandler.Revision{SpecGeneration: 1, RuntimeInstanceID: owner.RuntimeInstanceID, AttachmentID: owner.AttachmentID, RouteGeneration: 1},
 		Owner: &owner, Snapshot: &actionhandler.SnapshotTransfer{Path: "/tmp/state"},
@@ -197,4 +216,111 @@ func TestActionsV2CarriesOwnerThroughVaultAndPolicyRelayCRUD(t *testing.T) {
 	}
 	_, found := reg.Fence(subject.FromSandboxUID("b"))
 	require.False(t, found, "relay must not materialize an unbound subject")
+}
+
+func TestActionsV2RequiresModeBeforeSideEffects(t *testing.T) {
+	for _, mode := range []string{"", "explicit", "unknown"} {
+		t.Run(mode, func(t *testing.T) {
+			srv, reg, _ := fastSandboxTestServer(t)
+			srv.SetActionsAPIVersion(actionhandler.APIVersionV2)
+			owner := actionsV2Owner("a", "runtime-a", "attachment-a", 1)
+			var body map[string]any
+			require.NoError(t, json.Unmarshal([]byte(actionsV2Body(t, actionhandler.OperationSetBinding, owner, vaultAllowPolicy())), &body))
+			body["mode"] = mode
+			raw, err := json.Marshal(body)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusBadRequest, doActionsV2(t, srv, string(raw)).Code)
+			_, registered := reg.Fence(subject.FromSandboxUID("a"))
+			require.False(t, registered)
+			record, err := srv.readOwnerRecord(subject.FromSandboxUID("a"))
+			require.NoError(t, err)
+			require.Nil(t, record)
+		})
+	}
+}
+
+func TestActionsV2RetirementSurvivesRestartAndRejectsOldSet(t *testing.T) {
+	srv, _, _ := fastSandboxTestServer(t)
+	// Exercise actual atomic files, not just the in-memory file seam.
+	srv.policyFiles.newFile = func(path string) (vaultFileStore, error) { return policy.NewAtomicPolicyFile(path) }
+	srv.SetActionsAPIVersion(actionhandler.APIVersionV2)
+	owner := actionsV2Owner("a", "runtime-a", "attachment-a", 1)
+	set := actionsV2Body(t, actionhandler.OperationSetBinding, owner, vaultAllowPolicy())
+	remove := actionsV2Body(t, actionhandler.OperationRemoveBinding, owner, nil)
+	require.Equal(t, http.StatusOK, doActionsV2(t, srv, set).Code)
+	require.Equal(t, http.StatusOK, doActionsV2(t, srv, remove).Code)
+	require.FileExists(t, filepath.Join(srv.policyFiles.dir, "a.json.owner"))
+	require.Error(t, validateOwnerDomain(srv.policyFiles.dir, constants.ActionsAPIVersion))
+	require.NoError(t, validateOwnerDomain(srv.policyFiles.dir, constants.ActionsAPIVersionV2))
+	require.Equal(t, http.StatusConflict, doActionsV2(t, srv, set).Code)
+	restarted, reg, _ := fastSandboxTestServer(t)
+	restarted.SetPolicyFiles(srv.policyFiles)
+	restarted.SetActionsAPIVersion(actionhandler.APIVersionV2)
+	require.Equal(t, http.StatusConflict, doActionsV2(t, restarted, set).Code)
+	require.Equal(t, http.StatusOK, doActionsV2(t, restarted, remove).Code)
+	observation := doActionsV2Relay(t, restarted, http.MethodGet, constants.ActionsV2OwnerPathPrefix+"a", owner, "")
+	require.Equal(t, http.StatusOK, observation.Code)
+	require.Contains(t, observation.Body.String(), `"state":"retired"`)
+	_, registered := reg.Fence(subject.FromSandboxUID("a"))
+	require.False(t, registered)
+}
+
+func TestActionsV2RetiresAnOwnerBeforeItsFirstSet(t *testing.T) {
+	srv, reg, _ := fastSandboxTestServer(t)
+	srv.SetActionsAPIVersion(actionhandler.APIVersionV2)
+	owner := actionsV2Owner("a", "runtime-a", "attachment-a", 1)
+	observation := doActionsV2Relay(t, srv, http.MethodGet, constants.ActionsV2OwnerPathPrefix+"a", owner, "")
+	require.Equal(t, http.StatusOK, observation.Code)
+	require.Contains(t, observation.Body.String(), `"state":"absent"`)
+	require.Equal(t, http.StatusOK, doActionsV2(t, srv, actionsV2Body(t, actionhandler.OperationRemoveBinding, owner, nil)).Code)
+	require.Equal(t, http.StatusConflict, doActionsV2(t, srv, actionsV2Body(t, actionhandler.OperationSetBinding, owner, vaultAllowPolicy())).Code)
+	_, registered := reg.Fence(subject.FromSandboxUID("a"))
+	require.False(t, registered)
+}
+
+func TestActionsV2RestoresSameOwnerButRejectsUnknownPersistentState(t *testing.T) {
+	srv, _, _ := fastSandboxTestServer(t)
+	srv.SetActionsAPIVersion(actionhandler.APIVersionV2)
+	owner := actionsV2Owner("a", "runtime-a", "attachment-a", 1)
+	set := actionsV2Body(t, actionhandler.OperationSetBinding, owner, vaultAllowPolicy())
+	require.Equal(t, http.StatusOK, doActionsV2(t, srv, set).Code)
+	restarted, _, _ := fastSandboxTestServer(t)
+	restarted.SetPolicyFiles(srv.policyFiles)
+	restarted.SetActionsAPIVersion(actionhandler.APIVersionV2)
+	require.Equal(t, http.StatusOK, doActionsV2(t, restarted, set).Code)
+	f, err := restarted.ownerFile(subject.FromSandboxUID("a"))
+	require.NoError(t, err)
+	_, err = f.SaveRaw([]byte(`{"version":"unknown"}`))
+	require.NoError(t, err)
+	require.Equal(t, http.StatusConflict, doActionsV2(t, restarted, set).Code)
+	require.Equal(t, http.StatusPreconditionFailed, doActionsV2Relay(t, restarted, http.MethodPost, constants.ActionsV2VaultRelayPathPrefix+"a", owner, vaultCredential()).Code)
+}
+
+func TestActionsV2OwnerPersistenceAndRetirementFailuresRemainClosed(t *testing.T) {
+	srv, reg, nft := fastSandboxTestServer(t)
+	srv.SetActionsAPIVersion(actionhandler.APIVersionV2)
+	owner := actionsV2Owner("a", "runtime-a", "attachment-a", 1)
+	subj := subject.FromSandboxUID("a")
+	file, err := srv.ownerFile(subj)
+	require.NoError(t, err)
+	fault := file.(*fakeVaultFile)
+	fault.saveState, fault.saveErr = policy.FileUnknown, fmt.Errorf("injected uncertain owner persistence")
+	set := actionsV2Body(t, actionhandler.OperationSetBinding, owner, vaultAllowPolicy())
+	require.Equal(t, http.StatusServiceUnavailable, doActionsV2(t, srv, set).Code)
+	_, registered := reg.Fence(subj)
+	require.False(t, registered, "no SET effects before owner persistence")
+	fault.saveState, fault.saveErr = policy.FileCommitted, nil
+	require.Equal(t, http.StatusOK, doActionsV2(t, srv, set).Code)
+	nft.removeErr = fmt.Errorf("injected cleanup failure")
+	remove := actionsV2Body(t, actionhandler.OperationRemoveBinding, owner, nil)
+	require.NotEqual(t, http.StatusOK, doActionsV2(t, srv, remove).Code)
+	record, err := srv.readOwnerRecord(subj)
+	require.NoError(t, err)
+	require.Equal(t, "retiring", record.Phase)
+	require.Equal(t, http.StatusConflict, doActionsV2(t, srv, set).Code)
+	nft.removeErr = nil
+	require.Equal(t, http.StatusOK, doActionsV2(t, srv, remove).Code)
+	record, err = srv.readOwnerRecord(subj)
+	require.NoError(t, err)
+	require.Equal(t, "retired", record.Phase)
 }

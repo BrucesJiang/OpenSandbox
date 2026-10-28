@@ -71,6 +71,9 @@ func runFastSandboxProfile(ctx context.Context, upstreamSpec *mitmproxy.Upstream
 	if err != nil {
 		log.Fatalf("fast-sandbox Actions protocol: %v", err)
 	}
+	if err := validateOwnerDomain(os.Getenv(constants.EnvEgressPolicyDir), actionsAPIVersion); err != nil {
+		log.Fatalf("fast-sandbox Actions domain: %v", err)
+	}
 
 	otelShutdown, err := telemetry.Init(ctx)
 	if err != nil {

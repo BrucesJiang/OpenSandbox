@@ -208,11 +208,50 @@ func (s *fastSandboxPolicyServer) handleActionsV2(w http.ResponseWriter, r *http
 		http.Error(w, "snapshot and state-transfer operations are not supported by Actions v2", http.StatusNotImplemented)
 		return
 	}
+	if env.Operation == actionhandler.OperationSetBinding && env.Binding.IsRemoval() {
+		http.Error(w, "live binding removal is unsupported; use Sandbox Delete", http.StatusNotImplemented)
+		return
+	}
+	record, err := s.readOwnerRecord(subj)
+	if err != nil {
+		http.Error(w, "owner persistence unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if env.Operation == actionhandler.OperationRemoveBinding && record != nil && record.Phase == "retired" {
+		writeJSON(w, http.StatusOK, struct{}{})
+		return
+	}
+	if env.Operation == actionhandler.OperationSetBinding || env.Operation == actionhandler.OperationRemoveBinding {
+		phase := "active"
+		if env.Operation == actionhandler.OperationRemoveBinding {
+			phase = "retiring"
+		}
+		if err := s.writeOwnerRecord(subj, *env.Owner, phase); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+	}
+	// An absent owner has no registered runtime to dispatch REMOVE to. Persist
+	// a terminal fence anyway, so a delayed initial SET cannot resurrect it.
+	if env.Operation == actionhandler.OperationRemoveBinding && record == nil {
+		if err := s.writeOwnerRecord(subj, *env.Owner, "retired"); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		writeJSON(w, http.StatusOK, struct{}{})
+		return
+	}
 	status, err := s.dispatchAction(r.Context(), env)
 	if err != nil {
 		logEgressUpdateFailedError(fmt.Sprintf("Actions v2 %s for sandbox %s failed: %v", env.Operation, env.Sandbox.UID, err))
 		http.Error(w, err.Error(), status)
 		return
+	}
+	if env.Operation == actionhandler.OperationRemoveBinding {
+		if err := s.writeOwnerRecord(subj, *env.Owner, "retired"); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
 	}
 	s.mu.Lock()
 	switch env.Operation {
@@ -228,24 +267,23 @@ func (s *fastSandboxPolicyServer) handleActionsV2(w http.ResponseWriter, r *http
 }
 
 func (s *fastSandboxPolicyServer) validateActionsV2Owner(subj subject.Subject, env *actionhandler.Envelope) error {
-	if env.Owner == nil || !env.Owner.Valid() || env.Owner.SandboxUID != env.Sandbox.UID ||
-		env.Owner.RuntimeInstanceID != env.Revision.RuntimeInstanceID || env.Owner.AttachmentID != env.Revision.AttachmentID ||
-		uint64(env.Owner.RouteGeneration) != env.Revision.RouteGeneration {
-		return fmt.Errorf("Actions v2 owner does not match the Sandbox revision")
+	record, err := s.readOwnerRecord(subj)
+	if err != nil {
+		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	current, found := s.actionOwners[subj]
-	if !found {
-		if env.Operation != actionhandler.OperationSetBinding {
-			return fmt.Errorf("Actions v2 owner is not registered")
+	if record == nil {
+		if env.Operation != actionhandler.OperationSetBinding && env.Operation != actionhandler.OperationRemoveBinding {
+			return fmt.Errorf("strict owner is not registered")
 		}
-		return nil
+		return s.cleanOwnerSubject(subj)
 	}
-	if current.Matches(*env.Owner) {
-		return nil
+	if !record.Owner.Matches(*env.Owner) {
+		return fmt.Errorf("strict owner mismatch; rebind is unsupported")
 	}
-	return fmt.Errorf("Actions v2 owner mismatch")
+	if record.Phase != "active" && env.Operation != actionhandler.OperationRemoveBinding {
+		return fmt.Errorf("strict owner is retiring or retired")
+	}
+	return nil
 }
 
 func (s *fastSandboxPolicyServer) handleActionsV2Owner(w http.ResponseWriter, r *http.Request) {
@@ -257,55 +295,35 @@ func (s *fastSandboxPolicyServer) handleActionsV2Owner(w http.ResponseWriter, r 
 	uid := strings.TrimPrefix(r.URL.Path, constants.ActionsV2OwnerPathPrefix)
 	owner, err := ownerFromRequest(r)
 	if !validVaultSubjectID(uid) || err != nil || owner.SandboxUID != uid {
-		http.Error(w, "a valid owner matching the Sandbox UID is required", http.StatusBadRequest)
+		http.Error(w, "valid matching owner required", http.StatusBadRequest)
 		return
 	}
-	ownerLock := s.ownerLock(subject.FromSandboxUID(uid))
-	ownerLock.RLock()
-	defer ownerLock.RUnlock()
-	release, err := s.acquireAction(r.Context())
-	if err != nil {
-		http.Error(w, "owner observation canceled", http.StatusServiceUnavailable)
-		return
-	}
-	defer release()
 	subj := subject.FromSandboxUID(uid)
-	s.mu.Lock()
-	current, ownerFound := s.actionOwners[subj]
-	residual := s.subjectHasLiveStateLocked(subj)
-	s.mu.Unlock()
-	regFence, registered := s.reg.Fence(subj)
-	if ownerFound {
-		if !current.Matches(owner) {
-			http.Error(w, "owner status is unknown or belongs to another owner", http.StatusConflict)
-			return
-		}
-		if registered {
-			if !regFence.Matches(subject.Fencing{RuntimeInstanceID: owner.RuntimeInstanceID, AttachmentID: owner.AttachmentID}) {
-				http.Error(w, "registered fence disagrees with the Actions v2 owner", http.StatusConflict)
-				return
-			}
-			writeJSON(w, http.StatusOK, actionhandler.OwnerObservation{State: "current", Owner: owner})
-			return
-		}
-	}
-	if registered || residual {
-		http.Error(w, "owner status is unknown; residual subject state exists", http.StatusConflict)
+	lock := s.ownerLock(subj)
+	lock.RLock()
+	defer lock.RUnlock()
+	record, err := s.readOwnerRecord(subj)
+	if err != nil {
+		http.Error(w, "owner persistence unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	residual, err = s.subjectHasPersistentState(subj)
-	if err != nil || residual {
-		http.Error(w, "owner retirement cannot be confirmed", http.StatusServiceUnavailable)
+	if record == nil {
+		if err := s.cleanOwnerSubject(subj); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		writeJSON(w, http.StatusOK, actionhandler.OwnerObservation{State: "absent", Owner: owner})
 		return
 	}
-	if ownerFound {
-		s.mu.Lock()
-		if currentOwner, ok := s.actionOwners[subj]; ok && currentOwner.Matches(owner) {
-			delete(s.actionOwners, subj)
-		}
-		s.mu.Unlock()
+	if !record.Owner.Matches(owner) {
+		http.Error(w, "owner mismatch", http.StatusConflict)
+		return
 	}
-	writeJSON(w, http.StatusOK, actionhandler.OwnerObservation{State: "retired", Owner: owner})
+	state := "current"
+	if record.Phase == "retired" {
+		state = "retired"
+	}
+	writeJSON(w, http.StatusOK, actionhandler.OwnerObservation{State: state, Owner: owner})
 }
 
 func (s *fastSandboxPolicyServer) subjectHasLiveStateLocked(subj subject.Subject) bool {
@@ -377,6 +395,11 @@ func (s *fastSandboxPolicyServer) validateRelayOwner(w http.ResponseWriter, r *h
 		return false
 	}
 	subj := subject.FromSandboxUID(uid)
+	record, recordErr := s.readOwnerRecord(subj)
+	if recordErr != nil || record == nil || record.Phase != "active" || !record.Owner.Matches(owner) {
+		http.Error(w, "strict owner is not active", http.StatusPreconditionFailed)
+		return false
+	}
 	s.mu.Lock()
 	current, found := s.actionOwners[subj]
 	s.mu.Unlock()
