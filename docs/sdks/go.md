@@ -79,6 +79,8 @@ The following snippets go inside a function returning `error`, with the live `sa
 
 `Execution.Text()` combines stdout events while preserving their line-ending bytes and any unterminated final fragment. It inserts a newline between events only when the preceding event ends in neither `\n` nor `\r`, preserving ordinary legacy stripped-line output without appending a final terminator. A trailing `\r` is always treated as a line ending, including when an older producer retained it as content while stripping another terminator.
 
+For a language-backed code execution returned by `Sandbox.ExecuteCode`, `CodeInterpreter.Execute` or `CodeInterpreter.ExecuteInContext`, `Text()` concatenates stdout events without inserting any newline: `"Loading"` followed by `"...done\n"` produces `"Loading...done\n"`. CR, LF and trailing terminators are preserved, and the fragments stay unchanged in `Execution.Stdout`. Requests with no context, an empty language, or the `command` or `background-command` language use the command-output rule above. The SDK records the formatting mode in an unexported field; a plain struct copy keeps it, while an `Execution` constructed by hand or reconstructed into a fresh value from JSON uses the command-output rule.
+
 Use structured callbacks for normal command output:
 
 ```go
