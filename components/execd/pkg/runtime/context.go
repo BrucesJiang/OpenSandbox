@@ -108,10 +108,15 @@ func (c *Controller) DeleteLanguageContext(language Language) error {
 }
 
 func (c *Controller) deleteSessionAndCleanup(session string) error {
-	if c.getJupyterKernel(session) == nil {
+	kernel := c.getJupyterKernel(session)
+	if kernel == nil {
 		return ErrContextNotFound
 	}
-	if err := c.jupyterClient().DeleteSession(session); err != nil {
+	client := kernel.client
+	if client == nil {
+		client = c.jupyterClient()
+	}
+	if err := client.DeleteSession(session); err != nil {
 		return err
 	}
 	c.jupyterClientMap.Delete(session)
@@ -174,7 +179,11 @@ func (c *Controller) createDefaultLanguageJupyterContext(language Language) erro
 
 // createJupyterContext performs the actual context creation workflow.
 func (c *Controller) createJupyterContext(request CreateContextRequest) (*jupyter.Client, *jupytersession.Session, error) {
-	client := c.jupyterClient()
+	token := c.jupyterToken()
+	if c.baseURL == "" || token == "" {
+		return nil, nil, errJupyterNotConfigured
+	}
+	client := c.jupyterClientWithToken(token)
 
 	kernel, err := c.searchKernel(client, request.Language)
 	if err != nil {
@@ -216,15 +225,19 @@ func (c *Controller) storeJupyterKernel(sessionID string, kernel *jupyterKernel)
 }
 
 func (c *Controller) jupyterClient() *jupyter.Client {
+	return c.jupyterClientWithToken(c.jupyterToken())
+}
+
+func (c *Controller) jupyterClientWithToken(token string) *jupyter.Client {
 	httpClient := &http.Client{
 		Transport: &jupyter.AuthTransport{
-			Token: c.token,
+			Token: token,
 			Base:  http.DefaultTransport,
 		},
 	}
 
 	return jupyter.NewClient(c.baseURL,
-		jupyter.WithToken(c.token),
+		jupyter.WithToken(token),
 		jupyter.WithHTTPClient(httpClient))
 }
 

@@ -37,6 +37,7 @@ var kernelWaitingBackoff = wait.Backoff{
 type Controller struct {
 	baseURL                 string
 	token                   string
+	jupyterRuntimeRoot      string
 	mu                      sync.RWMutex
 	jupyterClientMap        sync.Map // map[sessionID]*jupyterKernel
 	defaultLanguageSessions sync.Map // map[Language]string

@@ -16,17 +16,31 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/alibaba/opensandbox/execd/pkg/jupyter"
 	"github.com/alibaba/opensandbox/execd/pkg/jupyter/execute"
 	"github.com/alibaba/opensandbox/execd/pkg/log"
 )
 
+var errJupyterNotConfigured = errors.New("language runtime server not configured, please check your image runtime")
+
+type jupyterRuntimeServerInfo struct {
+	Port  int    `json:"port"`
+	Token string `json:"token"`
+}
+
 // runJupyter executes code through a Jupyter kernel.
 func (c *Controller) runJupyter(ctx context.Context, request *ExecuteCodeRequest) error {
-	if c.baseURL == "" || c.token == "" {
-		return errors.New("language runtime server not configured, please check your image runtime")
+	if c.baseURL == "" {
+		return errJupyterNotConfigured
 	}
 	if request.Context == "" {
 		if c.getDefaultLanguageSession(request.Language) == "" {
@@ -45,6 +59,9 @@ func (c *Controller) runJupyter(ctx context.Context, request *ExecuteCodeRequest
 
 	kernel := c.getJupyterKernel(targetSessionID)
 	if kernel == nil {
+		if c.jupyterToken() == "" {
+			return errJupyterNotConfigured
+		}
 		return ErrContextNotFound
 	}
 
@@ -164,4 +181,89 @@ func (c *Controller) searchKernel(client *jupyter.Client, language Language) (st
 	}
 
 	return kernelName, nil
+}
+
+func (c *Controller) jupyterToken() string {
+	if c.token != "" {
+		return c.token
+	}
+	return c.discoverJupyterToken()
+}
+
+// discoverJupyterToken reads the token written by a standalone code-interpreter
+// entrypoint in /tmp/opensandbox-jupyter.*/jpserver-*.json when execd is
+// launched without bootstrap.sh (for example via fast-sandbox infraComponents).
+func (c *Controller) discoverJupyterToken() string {
+	targetPort := jupyterPortFromBaseURL(c.baseURL)
+	if targetPort <= 0 {
+		return ""
+	}
+	root := c.jupyterRuntimeRoot
+	if root == "" {
+		root = "/tmp"
+	}
+	matches, err := filepath.Glob(filepath.Join(root, "opensandbox-jupyter.*", "jpserver-*.json"))
+	if err != nil {
+		return ""
+	}
+
+	var (
+		bestToken   string
+		bestModTime time.Time
+	)
+	for _, match := range matches {
+		token, modTime, ok := readJupyterRuntimeToken(match, targetPort)
+		if !ok {
+			continue
+		}
+		if bestToken == "" || modTime.After(bestModTime) {
+			bestToken = token
+			bestModTime = modTime
+		}
+	}
+	return bestToken
+}
+
+func readJupyterRuntimeToken(filePath string, targetPort int) (string, time.Time, bool) {
+	fileInfo, err := os.Lstat(filePath)
+	if err != nil || !fileInfo.Mode().IsRegular() {
+		return "", time.Time{}, false
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", time.Time{}, false
+	}
+
+	var info jupyterRuntimeServerInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return "", time.Time{}, false
+	}
+	token := strings.TrimSpace(info.Token)
+	if token == "" || info.Port != targetPort {
+		return "", time.Time{}, false
+	}
+	return token, fileInfo.ModTime(), true
+}
+
+func jupyterPortFromBaseURL(baseURL string) int {
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return 0
+	}
+	if portStr := parsed.Port(); portStr != "" {
+		port, err := strconv.Atoi(portStr)
+		if err != nil || port <= 0 {
+			return 0
+		}
+		return port
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http":
+		return 80
+	case "https":
+		return 443
+	default:
+		return 0
+	}
 }
