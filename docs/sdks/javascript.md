@@ -341,7 +341,16 @@ await sandbox.files.deleteDirectories(["/tmp/demo"]);
 
 For binary files, pass a `Uint8Array` to `writeFiles()` and read with `readBytes()` or `readBytesStream()`. Read options support `offset` and `limit` for partial downloads.
 
-Use `readBytesDetailed` or `readBytesStreamDetailed` when Range response metadata is required. Close a detailed stream body if it is not fully consumed.
+Use `readBytesDetailed` or `readBytesStreamDetailed` for the body together with HTTP status and range metadata; unknown sizes use `-1`. Both methods are optional on `SandboxFiles`; check for support before calling them. Close a detailed stream body with `await download.body.close()` if it is not fully consumed.
+
+```ts
+if (sandbox.files.readBytesDetailed) {
+  const download = await sandbox.files.readBytesDetailed("/tmp/data.bin", { range: "bytes=5-" });
+  console.log(download.isPartial, download.totalSize, download.contentRange);
+}
+```
+
+Check `isPartial` before appending a resumed download: a `200` response means the server ignored Range and returned the whole file.
 
 #### File operations with an explicit identity
 

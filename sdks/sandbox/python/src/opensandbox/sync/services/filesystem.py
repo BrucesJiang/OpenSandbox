@@ -22,7 +22,7 @@ This is the sync counterpart of :mod:`opensandbox.services.filesystem`.
 
 from collections.abc import Iterator
 from io import IOBase
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from opensandbox.models.filesystem import (
     ContentReplaceEntry,
@@ -108,15 +108,6 @@ class FilesystemSync(Protocol):
         """
         ...
 
-    def read_bytes_detailed(
-        self,
-        path: str,
-        *,
-        range_header: str | None = None,
-        offset: int | None = None,
-        limit: int | None = None,
-    ) -> ReadBytesResponse[bytes]: ...
-
     def read_bytes_stream(
         self,
         path: str,
@@ -141,16 +132,6 @@ class FilesystemSync(Protocol):
             SandboxException: If the operation fails.
         """
         ...
-
-    def read_bytes_stream_detailed(
-        self,
-        path: str,
-        *,
-        chunk_size: int = 64 * 1024,
-        range_header: str | None = None,
-        offset: int | None = None,
-        limit: int | None = None,
-    ) -> ReadBytesResponse[ReadBytesStream]: ...
 
     def write_files(self, entries: list[WriteEntry]) -> None:
         """
@@ -321,3 +302,27 @@ class FilesystemSync(Protocol):
             SandboxException: If the operation fails.
         """
         ...
+
+
+@runtime_checkable
+class DownloadFilesystemSync(FilesystemSync, Protocol):
+    """Optional filesystem capability for HTTP download response metadata."""
+
+    def read_bytes_detailed(
+        self,
+        path: str,
+        *,
+        range_header: str | None = None,
+        offset: int | None = None,
+        limit: int | None = None,
+    ) -> ReadBytesResponse[bytes]: ...
+
+    def read_bytes_stream_detailed(
+        self,
+        path: str,
+        *,
+        chunk_size: int = 64 * 1024,
+        range_header: str | None = None,
+        offset: int | None = None,
+        limit: int | None = None,
+    ) -> ReadBytesResponse[ReadBytesStream]: ...

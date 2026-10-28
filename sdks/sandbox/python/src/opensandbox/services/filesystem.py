@@ -20,7 +20,7 @@ Protocol for sandbox filesystem operations.
 """
 from collections.abc import AsyncGenerator
 from io import IOBase
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from opensandbox.models.filesystem import (
     AsyncReadBytesStream,
@@ -103,15 +103,6 @@ class Filesystem(Protocol):
         """
         ...
 
-    async def read_bytes_detailed(
-        self,
-        path: str,
-        *,
-        range_header: str | None = None,
-        offset: int | None = None,
-        limit: int | None = None,
-    ) -> ReadBytesResponse[bytes]: ...
-
     async def read_bytes_stream(
         self,
         path: str,
@@ -125,16 +116,6 @@ class Filesystem(Protocol):
         Stream file content as bytes chunks; close the started generator on early exit.
         """
         ...
-
-    async def read_bytes_stream_detailed(
-        self,
-        path: str,
-        *,
-        chunk_size: int = 64 * 1024,
-        range_header: str | None = None,
-        offset: int | None = None,
-        limit: int | None = None,
-    ) -> ReadBytesResponse[AsyncReadBytesStream]: ...
 
     async def write_files(self, entries: list[WriteEntry]) -> None:
         """
@@ -305,3 +286,27 @@ class Filesystem(Protocol):
             SandboxException: if the operation fails
         """
         ...
+
+
+@runtime_checkable
+class DownloadFilesystem(Filesystem, Protocol):
+    """Optional filesystem capability for HTTP download response metadata."""
+
+    async def read_bytes_detailed(
+        self,
+        path: str,
+        *,
+        range_header: str | None = None,
+        offset: int | None = None,
+        limit: int | None = None,
+    ) -> ReadBytesResponse[bytes]: ...
+
+    async def read_bytes_stream_detailed(
+        self,
+        path: str,
+        *,
+        chunk_size: int = 64 * 1024,
+        range_header: str | None = None,
+        offset: int | None = None,
+        limit: int | None = None,
+    ) -> ReadBytesResponse[AsyncReadBytesStream]: ...

@@ -459,6 +459,13 @@ type ByteRange struct {
 	Raw string
 }
 
+// DownloadFilesystem is the optional capability for HTTP download metadata.
+// ExecdClient implements it, including clients returned by FilesWithIdentity.
+// Callers must close the returned response body.
+type DownloadFilesystem interface {
+	DownloadFileResponse(context.Context, string, string, ...DownloadFileOptions) (*DownloadFileResponse, error)
+}
+
 // DownloadFileResponse contains a download body and its HTTP response
 // metadata. The caller must close Body.
 type DownloadFileResponse struct {

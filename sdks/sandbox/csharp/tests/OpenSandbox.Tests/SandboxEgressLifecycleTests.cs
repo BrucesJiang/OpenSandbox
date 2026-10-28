@@ -27,6 +27,17 @@ namespace OpenSandbox.Tests;
 public class SandboxEgressLifecycleTests
 {
     [Fact]
+    public async Task LegacyFilesystem_ShouldRejectUnsupportedDownloadMetadata()
+    {
+        ISandboxFiles files = new StubFiles();
+        Func<Task> bytes = () => files.ReadBytesDetailedAsync("/data.bin");
+        Func<Task> stream = () => files.ReadBytesStreamDetailedAsync("/data.bin");
+
+        await bytes.Should().ThrowAsync<NotSupportedException>().WithMessage("*download metadata*");
+        await stream.Should().ThrowAsync<NotSupportedException>().WithMessage("*download metadata*");
+    }
+
+    [Fact]
     public async Task CreateAsync_ShouldBuildEgressStackOnce_AndReuseItForOperations()
     {
         var sandboxes = new StubSandboxes();
@@ -929,14 +940,8 @@ public class SandboxEgressLifecycleTests
         public Task<byte[]> ReadBytesAsync(string path, ReadBytesOptions? options = null, CancellationToken cancellationToken = default) =>
             throw new NotImplementedException();
 
-        public Task<ReadBytesResponse<byte[]>> ReadBytesDetailedAsync(string path, ReadBytesOptions? options = null, CancellationToken cancellationToken = default) =>
-            throw new NotImplementedException();
-
         public IAsyncEnumerable<byte[]> ReadBytesStreamAsync(string path, ReadBytesOptions? options = null, CancellationToken cancellationToken = default) =>
             AsyncEnumerable.Empty<byte[]>();
-
-        public Task<ReadBytesResponse<IAsyncReadBytesStream>> ReadBytesStreamDetailedAsync(string path, ReadBytesOptions? options = null, CancellationToken cancellationToken = default) =>
-            throw new NotImplementedException();
 
         public Task DeleteFilesAsync(IEnumerable<string> paths, CancellationToken cancellationToken = default) =>
             throw new NotImplementedException();

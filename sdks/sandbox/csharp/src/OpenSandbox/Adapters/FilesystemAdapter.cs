@@ -27,7 +27,7 @@ namespace OpenSandbox.Adapters;
 /// <summary>
 /// Adapter for the execd filesystem service.
 /// </summary>
-internal sealed class FilesystemAdapter : IIdentitySandboxFiles
+internal sealed class FilesystemAdapter : IIdentitySandboxFiles, IDownloadSandboxFiles
 {
     internal const uint MaxIdentityId = uint.MaxValue - 1;
     private readonly HttpClientWrapper _client;

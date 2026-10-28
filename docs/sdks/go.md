@@ -272,6 +272,17 @@ if err := sandbox.DeleteFiles(ctx, []string{"/tmp/demo.txt"}); err != nil {
 
 The same upload/download methods support binary files. Pass a Range header such as `"bytes=0-1023"` to `DownloadFile` for a partial download.
 
+Use `DownloadFileResponse` for the body together with HTTP status and range metadata; unknown sizes use `-1`. Check `IsPartial()` before appending a resumed download, and close `Body` after use:
+
+```go
+download, err := sandbox.DownloadFileResponse(ctx, "/tmp/data.bin", "bytes=5-")
+if err != nil {
+    return err
+}
+defer download.Body.Close()
+fmt.Println(download.IsPartial(), download.TotalSize, download.ContentRange)
+```
+
 #### File operations with an explicit identity
 
 Bind a filesystem client to a Linux UID and GID:
@@ -286,6 +297,8 @@ if err != nil {
 The bound client exposes the usual file operations and shares the sandbox connection, authentication, and endpoint routing headers. The existing file client retains its default identity. Select the UID/GID separately for command execution.
 
 This requires Linux and an Execd version that supports filesystem execution identity. Unsupported servers return an error; requests never fall back to the default filesystem routes. Keep sandbox credentials and identity selection in the trusted backend. Linux filesystem permissions apply; this feature does not create a tenant isolation boundary. See [Execd](/architecture/data-plane/execd) for permission and workspace provisioning details.
+
+For download metadata on this client, check the optional capability with `downloads, ok := files.(opensandbox.DownloadFilesystem)`, then call `downloads.DownloadFileResponse` when `ok` is true.
 
 ### Pause and reconnect
 

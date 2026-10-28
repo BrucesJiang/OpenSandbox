@@ -124,7 +124,9 @@ interface Filesystem {
         range: String? = null,
         offset: Int? = null,
         limit: Int? = null,
-    ): ReadBytesResponse<ByteArray>
+    ): ReadBytesResponse<ByteArray> {
+        throw UnsupportedOperationException("The filesystem adapter does not support download metadata")
+    }
 
     /**
      * Opens a file for reading as an InputStream.
@@ -173,7 +175,9 @@ interface Filesystem {
         range: String? = null,
         offset: Int? = null,
         limit: Int? = null,
-    ): ReadBytesResponse<InputStream>
+    ): ReadBytesResponse<InputStream> {
+        throw UnsupportedOperationException("The filesystem adapter does not support download metadata")
+    }
 
     /**
      * Writes content to files based on the provided write entries.

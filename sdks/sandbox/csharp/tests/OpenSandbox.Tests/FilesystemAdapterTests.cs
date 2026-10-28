@@ -19,6 +19,7 @@ using OpenSandbox.Adapters;
 using OpenSandbox.Core;
 using OpenSandbox.Internal;
 using OpenSandbox.Models;
+using OpenSandbox.Services;
 using Xunit;
 
 namespace OpenSandbox.Tests;
@@ -345,7 +346,7 @@ public class FilesystemAdapterTests
         errorContent.Disposed.Should().BeTrue();
     }
 
-    private static FilesystemAdapter CreateAdapter(HttpClient client)
+    private static ISandboxFiles CreateAdapter(HttpClient client)
     {
         var wrapper = new HttpClientWrapper(client, "http://localhost:8080");
         return new FilesystemAdapter(wrapper, "http://localhost:8080", new Dictionary<string, string>());
