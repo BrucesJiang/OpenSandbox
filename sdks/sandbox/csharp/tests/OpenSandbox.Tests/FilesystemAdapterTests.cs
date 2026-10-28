@@ -248,37 +248,23 @@ public class FilesystemAdapterTests
         response.TotalSize.Should().Be(10);
     }
 
-    [Fact]
-    public async Task ReadBytesDetailedAsync_ShouldIdentifyPartialResponseWithoutContentRange()
+    [Theory]
+    [InlineData(null, -1, -1)]
+    [InlineData("garbage", -1, -1)]
+    [InlineData("bytes 5-9/*", 5, 9)]
+    [InlineData("bytes 0-4/4", -1, -1)]
+    public async Task ReadBytesDetailedAsync_ShouldReportUnknownTotalSize(string? raw, long start, long end)
     {
         var handler = new DownloadHandler();
-        handler.Enqueue(DownloadResponse(HttpStatusCode.PartialContent, "hello"));
+        handler.Enqueue(DownloadResponse(HttpStatusCode.PartialContent, "hello", raw));
         using var client = new HttpClient(handler);
         var adapter = CreateAdapter(client);
 
         var response = await adapter.ReadBytesDetailedAsync("/data.bin");
 
         response.IsPartial.Should().BeTrue();
-        response.ContentRange.Should().BeNull();
+        response.ContentRange.Should().Be(raw == null ? null : new ByteRange(start, end, -1, raw));
         response.TotalSize.Should().Be(-1);
-    }
-
-    [Fact]
-    public async Task ReadBytesDetailedAsync_ShouldPreserveInvalidAndUnknownRanges()
-    {
-        var handler = new DownloadHandler();
-        handler.Enqueue(DownloadResponse(HttpStatusCode.PartialContent, "hello", "garbage"));
-        handler.Enqueue(DownloadResponse(HttpStatusCode.PartialContent, "hello", "bytes 5-9/*"));
-        using var client = new HttpClient(handler);
-        var adapter = CreateAdapter(client);
-
-        var invalid = await adapter.ReadBytesDetailedAsync("/data.bin");
-        var unknown = await adapter.ReadBytesDetailedAsync("/data.bin");
-
-        invalid.ContentRange.Should().Be(new ByteRange(-1, -1, -1, "garbage"));
-        invalid.TotalSize.Should().Be(-1);
-        unknown.ContentRange.Should().Be(new ByteRange(5, 9, -1, "bytes 5-9/*"));
-        unknown.TotalSize.Should().Be(-1);
     }
 
     [Fact]

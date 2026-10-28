@@ -233,42 +233,22 @@ class FilesystemAdapterTest {
     }
 
     @Test
-    fun `readByteArrayDetailed identifies a partial response without Content-Range`() {
-        mockWebServer.enqueue(
-            MockResponse()
-                .setResponseCode(206)
-                .setBody("hello"),
-        )
+    fun `readByteArrayDetailed reports unknown total size`() {
+        for ((raw, expected) in listOf(
+            null to null,
+            "garbage" to ByteRange(-1, -1, -1, "garbage"),
+            "bytes 5-9/*" to ByteRange(5, 9, -1, "bytes 5-9/*"),
+        )) {
+            val response = MockResponse().setResponseCode(206).setBody("hello")
+            if (raw != null) response.setHeader("Content-Range", raw)
+            mockWebServer.enqueue(response)
 
-        val response = filesystemAdapter.readByteArrayDetailed("/data.bin")
+            val download = filesystemAdapter.readByteArrayDetailed("/data.bin")
 
-        assertTrue(response.isPartial)
-        assertNull(response.contentRange)
-        assertEquals(-1, response.totalSize)
-    }
-
-    @Test
-    fun `readByteArrayDetailed preserves invalid and unknown Content-Range values`() {
-        mockWebServer.enqueue(
-            MockResponse()
-                .setResponseCode(206)
-                .setHeader("Content-Range", "garbage")
-                .setBody("hello"),
-        )
-        mockWebServer.enqueue(
-            MockResponse()
-                .setResponseCode(206)
-                .setHeader("Content-Range", "bytes 5-9/*")
-                .setBody("hello"),
-        )
-
-        val invalid = filesystemAdapter.readByteArrayDetailed("/data.bin")
-        val unknown = filesystemAdapter.readByteArrayDetailed("/data.bin")
-
-        assertEquals(ByteRange(-1, -1, -1, "garbage"), invalid.contentRange)
-        assertEquals(-1, invalid.totalSize)
-        assertEquals(ByteRange(5, 9, -1, "bytes 5-9/*"), unknown.contentRange)
-        assertEquals(-1, unknown.totalSize)
+            assertTrue(download.isPartial)
+            assertEquals(expected, download.contentRange)
+            assertEquals(-1, download.totalSize)
+        }
     }
 
     @Test

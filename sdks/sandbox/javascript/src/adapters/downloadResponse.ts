@@ -59,7 +59,7 @@ export function createReadBytesResponse<TBody>(
     contentLength,
     totalSize: isPartial
       ? (contentRange?.total ?? -1)
-      : lineBased ? -1 : contentLength,
+      : (lineBased ? -1 : contentLength),
     contentRange,
     isPartial,
   };

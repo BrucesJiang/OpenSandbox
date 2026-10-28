@@ -16,7 +16,6 @@ using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using OpenSandbox.Core;
 using OpenSandbox.Internal;
 using OpenSandbox.Models;
@@ -34,9 +33,6 @@ internal sealed class FilesystemAdapter : IIdentitySandboxFiles, IDownloadSandbo
     private readonly string _baseUrl;
     private readonly string _identityBaseUrl;
     private readonly IReadOnlyDictionary<string, string> _headers;
-    private static readonly Regex ContentRangeRegex = new(
-        @"^bytes\s+(\d+)-(\d+)/(\d+|\*)$",
-        RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -302,25 +298,12 @@ internal sealed class FilesystemAdapter : IIdentitySandboxFiles, IDownloadSandbo
             return null;
         }
 
-        var invalid = new ByteRange(-1, -1, -1, raw!);
-        var match = ContentRangeRegex.Match(raw!);
-        if (!match.Success ||
-            !long.TryParse(match.Groups[1].Value, out var start) ||
-            !long.TryParse(match.Groups[2].Value, out var end))
+        if (ContentRangeHeaderValue.TryParse(raw, out var range) &&
+            string.Equals(range.Unit, "bytes", StringComparison.OrdinalIgnoreCase) && range.HasRange)
         {
-            return invalid;
+            return new ByteRange(range.From!.Value, range.To!.Value, range.Length ?? -1, raw!);
         }
-
-        var total = -1L;
-        if (match.Groups[3].Value != "*" && !long.TryParse(match.Groups[3].Value, out total))
-        {
-            return invalid;
-        }
-        if (end < start || (total != -1 && total <= end))
-        {
-            return invalid;
-        }
-        return new ByteRange(start, end, total, raw!);
+        return new ByteRange(-1, -1, -1, raw!);
     }
 
     private static string? GetContentHeader(HttpResponseMessage response, string name)

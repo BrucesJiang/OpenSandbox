@@ -83,47 +83,24 @@ test("readBytesDetailed identifies an ignored Range request", async () => {
   assert.equal(response.totalSize, 10);
 });
 
-test("readBytesDetailed identifies a partial response without Content-Range", async () => {
-  const adapter = createAdapter(async () =>
-    new Response("hello", {
-      status: 206,
-    }),
-  );
-
-  const response = await adapter.readBytesDetailed("/data.bin");
-
-  assert.equal(response.isPartial, true);
-  assert.equal(response.contentRange, undefined);
-  assert.equal(response.totalSize, -1);
-});
-
-test("readBytesDetailed preserves malformed and unknown Content-Range values", async () => {
-  const ranges = ["garbage", "bytes 5-9/*"];
-  const adapter = createAdapter(async () =>
-    new Response("hello", {
-      status: 206,
-      headers: { "Content-Range": ranges.shift() },
-    }),
-  );
-
-  const malformed = await adapter.readBytesDetailed("/data.bin");
-  assert.deepEqual(malformed.contentRange, {
-    start: -1,
-    end: -1,
-    total: -1,
-    raw: "garbage",
+for (const [raw, expected] of [
+  [undefined, undefined],
+  ["garbage", { start: -1, end: -1, total: -1, raw: "garbage" }],
+  ["bytes 5-9/*", { start: 5, end: 9, total: -1, raw: "bytes 5-9/*" }],
+]) {
+  test(`readBytesDetailed reports unknown total size: ${raw}`, async () => {
+    const adapter = createAdapter(async () =>
+      new Response("hello", {
+        status: 206,
+        headers: raw ? { "Content-Range": raw } : {},
+      }),
+    );
+    const response = await adapter.readBytesDetailed("/data.bin");
+    assert.equal(response.isPartial, true);
+    assert.deepEqual(response.contentRange, expected);
+    assert.equal(response.totalSize, -1);
   });
-  assert.equal(malformed.totalSize, -1);
-
-  const unknown = await adapter.readBytesDetailed("/data.bin");
-  assert.deepEqual(unknown.contentRange, {
-    start: 5,
-    end: 9,
-    total: -1,
-    raw: "bytes 5-9/*",
-  });
-  assert.equal(unknown.totalSize, -1);
-});
+}
 
 test("detailed and legacy streaming reads return the response body", async () => {
   const adapter = createAdapter(async () =>
