@@ -53,11 +53,14 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/alibaba/opensandbox/egress/pkg/actionhandler"
@@ -93,6 +96,10 @@ func (s *fastSandboxPolicyServer) handleActionsStatus(w http.ResponseWriter, r *
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	writeJSON(w, http.StatusOK, s.actionStatusResponse())
+}
+
+func (s *fastSandboxPolicyServer) actionStatusResponse() actionhandler.StatusResponse {
 	recovery := s.vaultRecoveryActive()
 	policyRecovery := s.policyRecoveryActive()
 	degraded := s.degradedVaultUIDs()
@@ -128,6 +135,18 @@ func (s *fastSandboxPolicyServer) handleActionsStatus(w http.ResponseWriter, r *
 			resp.MitmCaError = reason
 		}
 	}
+	return resp
+}
+
+func (s *fastSandboxPolicyServer) handleActionsV2Status(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	resp := s.actionStatusResponse()
+	resp.APIVersion = constants.ActionsAPIVersionV2
+	resp.OwnerStatus = true
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -157,6 +176,215 @@ func (s *fastSandboxPolicyServer) handleActions(w http.ResponseWriter, r *http.R
 		return
 	}
 	writeJSON(w, http.StatusOK, struct{}{})
+}
+
+func (s *fastSandboxPolicyServer) handleActionsV2(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxPolicyBodyBytes))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to read action body: %v", err), http.StatusBadRequest)
+		return
+	}
+	env, err := actionhandler.ParseEnvelopeV2(body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("invalid Actions v2 envelope: %v", err), http.StatusBadRequest)
+		return
+	}
+	subj := subject.FromSandboxUID(env.Sandbox.UID)
+	ownerLock := s.ownerLock(subj)
+	ownerLock.Lock()
+	defer ownerLock.Unlock()
+	if err := s.validateActionsV2Owner(subj, env); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	switch env.Operation {
+	case actionhandler.OperationSetBinding, actionhandler.OperationLifecycleHook, actionhandler.OperationRemoveBinding:
+	default:
+		http.Error(w, "snapshot and state-transfer operations are not supported by Actions v2", http.StatusNotImplemented)
+		return
+	}
+	status, err := s.dispatchAction(r.Context(), env)
+	if err != nil {
+		logEgressUpdateFailedError(fmt.Sprintf("Actions v2 %s for sandbox %s failed: %v", env.Operation, env.Sandbox.UID, err))
+		http.Error(w, err.Error(), status)
+		return
+	}
+	s.mu.Lock()
+	switch env.Operation {
+	case actionhandler.OperationSetBinding:
+		s.actionOwners[subj] = *env.Owner
+	case actionhandler.OperationRemoveBinding:
+		if current, ok := s.actionOwners[subj]; ok && current.Matches(*env.Owner) {
+			delete(s.actionOwners, subj)
+		}
+	}
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, struct{}{})
+}
+
+func (s *fastSandboxPolicyServer) validateActionsV2Owner(subj subject.Subject, env *actionhandler.Envelope) error {
+	if env.Owner == nil || !env.Owner.Valid() || env.Owner.SandboxUID != env.Sandbox.UID ||
+		env.Owner.RuntimeInstanceID != env.Revision.RuntimeInstanceID || env.Owner.AttachmentID != env.Revision.AttachmentID ||
+		uint64(env.Owner.RouteGeneration) != env.Revision.RouteGeneration {
+		return fmt.Errorf("Actions v2 owner does not match the Sandbox revision")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, found := s.actionOwners[subj]
+	if !found {
+		if env.Operation != actionhandler.OperationSetBinding {
+			return fmt.Errorf("Actions v2 owner is not registered")
+		}
+		return nil
+	}
+	if current.Matches(*env.Owner) {
+		return nil
+	}
+	return fmt.Errorf("Actions v2 owner mismatch")
+}
+
+func (s *fastSandboxPolicyServer) handleActionsV2Owner(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	uid := strings.TrimPrefix(r.URL.Path, constants.ActionsV2OwnerPathPrefix)
+	owner, err := ownerFromRequest(r)
+	if !validVaultSubjectID(uid) || err != nil || owner.SandboxUID != uid {
+		http.Error(w, "a valid owner matching the Sandbox UID is required", http.StatusBadRequest)
+		return
+	}
+	ownerLock := s.ownerLock(subject.FromSandboxUID(uid))
+	ownerLock.RLock()
+	defer ownerLock.RUnlock()
+	release, err := s.acquireAction(r.Context())
+	if err != nil {
+		http.Error(w, "owner observation canceled", http.StatusServiceUnavailable)
+		return
+	}
+	defer release()
+	subj := subject.FromSandboxUID(uid)
+	s.mu.Lock()
+	current, ownerFound := s.actionOwners[subj]
+	residual := s.subjectHasLiveStateLocked(subj)
+	s.mu.Unlock()
+	regFence, registered := s.reg.Fence(subj)
+	if ownerFound {
+		if !current.Matches(owner) {
+			http.Error(w, "owner status is unknown or belongs to another owner", http.StatusConflict)
+			return
+		}
+		if registered {
+			if !regFence.Matches(subject.Fencing{RuntimeInstanceID: owner.RuntimeInstanceID, AttachmentID: owner.AttachmentID}) {
+				http.Error(w, "registered fence disagrees with the Actions v2 owner", http.StatusConflict)
+				return
+			}
+			writeJSON(w, http.StatusOK, actionhandler.OwnerObservation{State: "current", Owner: owner})
+			return
+		}
+	}
+	if registered || residual {
+		http.Error(w, "owner status is unknown; residual subject state exists", http.StatusConflict)
+		return
+	}
+	residual, err = s.subjectHasPersistentState(subj)
+	if err != nil || residual {
+		http.Error(w, "owner retirement cannot be confirmed", http.StatusServiceUnavailable)
+		return
+	}
+	if ownerFound {
+		s.mu.Lock()
+		if currentOwner, ok := s.actionOwners[subj]; ok && currentOwner.Matches(owner) {
+			delete(s.actionOwners, subj)
+		}
+		s.mu.Unlock()
+	}
+	writeJSON(w, http.StatusOK, actionhandler.OwnerObservation{State: "retired", Owner: owner})
+}
+
+func (s *fastSandboxPolicyServer) subjectHasLiveStateLocked(subj subject.Subject) bool {
+	_, rebind := s.rebinds[subj]
+	_, vault := s.vaults[subj]
+	_, policy := s.policies[subj]
+	_, pending := s.pendingPolicies[subj]
+	_, attachment := s.subjAtt[subj]
+	_, fence := s.subjFence[subj]
+	return rebind || vault || policy || pending || attachment || fence
+}
+
+func (s *fastSandboxPolicyServer) subjectHasPersistentState(subj subject.Subject) (bool, error) {
+	if s.vaultFiles != nil {
+		fs, err := s.vaultFiles.storeFor(subj)
+		if err != nil {
+			return false, err
+		}
+		snapshot, err := fs.Snapshot()
+		if err != nil {
+			return false, err
+		}
+		if snapshot.Exists() || s.vaultFiles.isSealed(subj) {
+			return true, nil
+		}
+	}
+	if s.policyFiles != nil {
+		fs, err := s.policyFiles.storeFor(subj)
+		if err != nil {
+			return false, err
+		}
+		snapshot, err := fs.Snapshot()
+		if err != nil {
+			return false, err
+		}
+		if snapshot.Exists() || s.policyFiles.isSealed(subj) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func ownerFromRequest(r *http.Request) (actionhandler.Owner, error) {
+	encoded := strings.TrimSpace(r.Header.Get(constants.EgressActionsOwnerHeader))
+	if encoded == "" {
+		return actionhandler.Owner{}, fmt.Errorf("owner header is required")
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return actionhandler.Owner{}, err
+	}
+	var owner actionhandler.Owner
+	if err := json.Unmarshal(decoded, &owner); err != nil {
+		return owner, err
+	}
+	if !owner.Valid() || strings.TrimSpace(r.Header.Get(constants.EgressActionsSandboxUIDHeader)) != owner.SandboxUID {
+		return owner, fmt.Errorf("owner header is incomplete or disagrees with Sandbox UID header")
+	}
+	return owner, nil
+}
+
+func (s *fastSandboxPolicyServer) validateRelayOwner(w http.ResponseWriter, r *http.Request, uid string) bool {
+	if s.actionsAPIVersion != constants.ActionsAPIVersionV2 {
+		return true
+	}
+	owner, err := ownerFromRequest(r)
+	if err != nil || owner.SandboxUID != uid {
+		http.Error(w, "relay owner must match the path Sandbox UID", http.StatusBadRequest)
+		return false
+	}
+	subj := subject.FromSandboxUID(uid)
+	s.mu.Lock()
+	current, found := s.actionOwners[subj]
+	s.mu.Unlock()
+	if !found || !current.Matches(owner) {
+		http.Error(w, "relay owner is not the current registered owner", http.StatusPreconditionFailed)
+		return false
+	}
+	return true
 }
 
 // dispatchAction validates effect-free input before entering the cancellable

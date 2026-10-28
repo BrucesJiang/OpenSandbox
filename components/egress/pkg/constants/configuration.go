@@ -15,10 +15,24 @@
 package constants
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
 )
+
+func ParseFastSandboxActionsAPIVersion(raw string) (string, error) {
+	version := strings.TrimSpace(raw)
+	if version == "" {
+		return ActionsAPIVersion, nil
+	}
+	switch version {
+	case ActionsAPIVersion, ActionsAPIVersionV2:
+		return version, nil
+	default:
+		return "", fmt.Errorf("unsupported Fast Sandbox Actions apiVersion %q", version)
+	}
+}
 
 const (
 	EnvCredentialVaultTrustedProxyCIDRs  = "OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_TRUSTED_PROXY_CIDRS"
@@ -43,9 +57,19 @@ const (
 // Lifecycle Hooks to the egress Handler over two Pod-loopback HTTP endpoints
 // on the action target port.
 const (
-	ActionsAPIVersion   = "sandbox.fast.io/actions/v1"
-	ActionsStatusPath   = "/_fastlet/v1/actions/status"
-	ActionsDispatchPath = "/_fastlet/v1/actions"
+	ActionsAPIVersion               = "sandbox.fast.io/actions/v1"
+	ActionsAPIVersionV2             = "sandbox.fast.io/actions/v2"
+	ActionsStatusPath               = "/_fastlet/v1/actions/status"
+	ActionsDispatchPath             = "/_fastlet/v1/actions"
+	ActionsV2StatusPath             = "/_fastlet/v2/actions/status"
+	ActionsV2DispatchPath           = "/_fastlet/v2/actions"
+	ActionsV2OwnerPathPrefix        = "/_fastlet/v2/owners/"
+	ActionsV2RelayPathPrefix        = "/_fastlet/v2/relay/"
+	ActionsV2VaultRelayPathPrefix   = ActionsV2RelayPathPrefix + "vault/"
+	ActionsV2PolicyRelayPathPrefix  = ActionsV2RelayPathPrefix + "policy/"
+	EnvFastSandboxActionsAPIVersion = "OPENSANDBOX_EGRESS_ACTIONS_API_VERSION"
+	EgressActionsOwnerHeader        = "X-Fast-Sandbox-Owner"
+	EgressActionsSandboxUIDHeader   = "X-Sandbox-Uid"
 
 	HookRuntimeReady   = "sandbox.runtime-ready"
 	HookDataPlaneReady = "sandbox.data-plane-ready"

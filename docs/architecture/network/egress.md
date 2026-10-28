@@ -57,6 +57,8 @@ Layers 1 and 2 decide *whether* a connection may happen; the transparent MITM la
 ::: warning Internal OSEP-0023 revision runtime
 `OPENSANDBOX_EGRESS_EXPERIMENTAL_REVISION_RUNTIME=true` is a development-only sidecar gate (default off) for the OSEP-0023 revision protocol. It adds no public configuration surface or supported `interceptionMode`, and does not enable Fast Sandbox.
 
+The Fast Sandbox management transport has a separate `OPENSANDBOX_EGRESS_ACTIONS_API_VERSION` switch (default v1). Its experimental v2 value only selects strict Actions/relay HTTP routes; it does not enable the OSEP-0023 revision runtime or TLS interception. A v2 Fastlet Pool and every egress Handler must use the same version. V2 supports legacy-mode binding and Vault/Policy relay operations for clean-base Firecracker sandboxes; snapshots, template state, pause/resume, and restore are unsupported. Owner metadata fences the Sandbox runtime but is not caller authentication. Because the listener is on Pod-netns loopback, verify management-port isolation for the exact Fastlet Pod composition before enabling v2; this code does not configure or test that isolation.
+
 The internal sidecar experiment covers bound HTTPS/443 HTTP/1.1 traffic and experimental HTTP/2 admission and bounded-drain wiring on the fixed-dependency direct/lazy path. Configured chained upstream proxies remain rejected for live HTTP/2. Long-held responses can still cause Go retries to time out; full client migration and Linux acceptance remain follow-up work. Key properties:
 
 - Admission is per connection and per request, from an immutable snapshot installed over an authenticated channel; unknown or mismatched state denies — the mode never falls back to decrypt-all.
