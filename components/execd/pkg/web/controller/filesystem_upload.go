@@ -358,7 +358,7 @@ func isUploadStagingName(name string) bool {
 // restored before the rename.
 func createUploadTemp(dir string, perm os.FileMode) (*os.File, error) {
 	var suffix [8]byte
-	for attempt := 0; attempt < 10; attempt++ {
+	for range 10 {
 		if _, err := rand.Read(suffix[:]); err != nil {
 			return nil, err
 		}
@@ -379,7 +379,7 @@ func createUploadTemp(dir string, perm os.FileMode) (*os.File, error) {
 // link instead of replacing the link itself.
 func resolveUploadTargetPath(path string) (string, *uploadError) {
 	resolved := path
-	for i := 0; i < maxUploadSymlinkDepth; i++ {
+	for range maxUploadSymlinkDepth {
 		info, err := os.Lstat(resolved)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
