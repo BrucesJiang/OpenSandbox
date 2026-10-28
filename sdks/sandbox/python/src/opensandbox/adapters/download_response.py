@@ -63,11 +63,10 @@ def create_read_bytes_response(
         if response.status_code == 206
         else None
     )
-    total_size = (
-        (content_range.total if content_range is not None else -1)
-        if response.status_code == 206
-        else (-1 if line_based else content_length)
-    )
+    if response.status_code == 206:
+        total_size = content_range.total if content_range is not None else -1
+    else:
+        total_size = -1 if line_based else content_length
 
     return ReadBytesResponse(
         body=body,
@@ -94,20 +93,12 @@ class _AsyncResponseByteStream:
             raise StopAsyncIteration
         try:
             return await self._iterator.__anext__()
-        except StopAsyncIteration:
-            await self.aclose()
-            raise
         except BaseException:
             await self.aclose()
             raise
 
     async def aclose(self) -> None:
-        if self._closed:
-            return
         self._closed = True
-        close_iterator = getattr(self._iterator, "aclose", None)
-        if close_iterator is not None:
-            await close_iterator()
         await self._response.aclose()
 
     async def __aenter__(self) -> "_AsyncResponseByteStream":
@@ -136,20 +127,12 @@ class _ResponseByteStream:
             raise StopIteration
         try:
             return next(self._iterator)
-        except StopIteration:
-            self.close()
-            raise
         except BaseException:
             self.close()
             raise
 
     def close(self) -> None:
-        if self._closed:
-            return
         self._closed = True
-        close_iterator = getattr(self._iterator, "close", None)
-        if close_iterator is not None:
-            close_iterator()
         self._response.close()
 
     def __enter__(self) -> "_ResponseByteStream":
@@ -170,7 +153,5 @@ def iter_async_response_bytes(
     return _AsyncResponseByteStream(response, chunk_size)
 
 
-def iter_response_bytes(
-    response: httpx.Response, chunk_size: int
-) -> ReadBytesStream:
+def iter_response_bytes(response: httpx.Response, chunk_size: int) -> ReadBytesStream:
     return _ResponseByteStream(response, chunk_size)

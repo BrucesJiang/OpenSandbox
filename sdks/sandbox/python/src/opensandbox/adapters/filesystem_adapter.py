@@ -197,7 +197,7 @@ class FilesystemAdapter(Filesystem):
         offset: int | None = None,
         limit: int | None = None,
     ) -> ReadBytesResponse[bytes]:
-        """Read file content as bytes with support for range and line-based requests.
+        """Read file bytes and HTTP response metadata.
 
         Args:
             path: Path to the file to read
@@ -209,7 +209,7 @@ class FilesystemAdapter(Filesystem):
                 Mutually exclusive with range_header.
 
         Returns:
-            File content as bytes
+            File bytes together with HTTP status and range metadata
 
         Raises:
             SandboxApiException: If the read operation fails

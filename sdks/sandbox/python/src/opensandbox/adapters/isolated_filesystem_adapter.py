@@ -230,7 +230,7 @@ class IsolatedFilesystemAdapter(Filesystem):
                 )
             return create_read_bytes_response(
                 response,
-            iter_async_response_bytes(response, chunk_size),
+                iter_async_response_bytes(response, chunk_size),
                 line_based=offset is not None or limit is not None,
             )
         except Exception as e:

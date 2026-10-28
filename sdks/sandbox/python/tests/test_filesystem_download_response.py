@@ -14,15 +14,19 @@
 # limitations under the License.
 #
 
+import asyncio
+
 import httpx
 import pytest
 
 from opensandbox.adapters.filesystem_adapter import FilesystemAdapter
 from opensandbox.config import ConnectionConfig
 from opensandbox.config.connection_sync import ConnectionConfigSync
-from opensandbox.models import ByteRange, ReadBytesResponse
+from opensandbox.models import ByteRange
 from opensandbox.models.sandboxes import SandboxEndpoint
+from opensandbox.services import DownloadFilesystem
 from opensandbox.sync.adapters.filesystem_adapter import FilesystemAdapterSync
+from opensandbox.sync.services import DownloadFilesystemSync
 
 
 def _endpoint() -> SandboxEndpoint:
@@ -51,7 +55,7 @@ async def test_async_read_bytes_detailed_exposes_partial_metadata() -> None:
     )
     response = await adapter.read_bytes_detailed("/data.bin", range_header="bytes=0-4")
 
-    assert isinstance(response, ReadBytesResponse)
+    assert isinstance(adapter, DownloadFilesystem)
     assert response.body == b"hello"
     assert response.status_code == 206
     assert response.is_partial is True
@@ -66,19 +70,24 @@ async def test_async_read_bytes_detailed_exposes_partial_metadata() -> None:
 
 
 @pytest.mark.asyncio
-async def test_async_read_bytes_detailed_identifies_ignored_and_invalid_ranges() -> (
-    None
-):
-    ranges = iter([None, "garbage", "bytes 5-9/*"])
-
+@pytest.mark.parametrize(
+    ("status", "raw", "expected_range", "total_size"),
+    [
+        (200, None, None, 5),
+        (206, None, None, -1),
+        (206, "garbage", ByteRange(-1, -1, -1, "garbage"), -1),
+        (206, "bytes 5-9/*", ByteRange(5, 9, -1, "bytes 5-9/*"), -1),
+    ],
+)
+async def test_async_read_bytes_detailed_handles_range_responses(
+    status, raw, expected_range, total_size
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        content_range = next(ranges)
-        status = 200 if content_range is None else 206
-        headers = {"Content-Length": "10"}
-        if content_range is not None:
-            headers["Content-Range"] = content_range
         return httpx.Response(
-            status, request=request, content=b"0123456789", headers=headers
+            status,
+            request=request,
+            content=b"hello",
+            headers={"Content-Range": raw} if raw is not None else {},
         )
 
     adapter = FilesystemAdapter(
@@ -86,36 +95,10 @@ async def test_async_read_bytes_detailed_identifies_ignored_and_invalid_ranges()
         _endpoint(),
     )
 
-    ignored = await adapter.read_bytes_detailed("/data.bin", range_header="bytes=5-")
-    assert ignored.is_partial is False
-    assert ignored.content_range is None
-    assert ignored.total_size == 10
-
-    malformed = await adapter.read_bytes_detailed("/data.bin")
-    assert malformed.content_range == ByteRange(-1, -1, -1, "garbage")
-    assert malformed.total_size == -1
-
-    unknown = await adapter.read_bytes_detailed("/data.bin")
-    assert unknown.content_range == ByteRange(5, 9, -1, "bytes 5-9/*")
-    assert unknown.total_size == -1
-    await adapter._httpx_client.aclose()
-
-
-@pytest.mark.asyncio
-async def test_async_read_bytes_detailed_identifies_partial_without_range() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(206, request=request, content=b"hello")
-
-    adapter = FilesystemAdapter(
-        ConnectionConfig(protocol="http", transport=httpx.MockTransport(handler)),
-        _endpoint(),
-    )
-
-    response = await adapter.read_bytes_detailed("/data.bin")
-
-    assert response.is_partial is True
-    assert response.content_range is None
-    assert response.total_size == -1
+    response = await adapter.read_bytes_detailed("/data.bin", range_header="bytes=5-")
+    assert response.is_partial is (status == 206)
+    assert response.content_range == expected_range
+    assert response.total_size == total_size
     await adapter._httpx_client.aclose()
 
 
@@ -171,6 +154,50 @@ async def test_async_detailed_and_legacy_streams_close_responses() -> None:
     await adapter._httpx_client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_async_detailed_stream_can_close_during_a_read() -> None:
+    reading = asyncio.Event()
+    release = asyncio.Event()
+
+    class Stream(_TrackingAsyncStream):
+        async def __aiter__(self):
+            yield b"a"
+            reading.set()
+            await release.wait()
+            yield b"b"
+
+    source = Stream()
+    response = httpx.Response(200, stream=source)
+    adapter = FilesystemAdapter(
+        ConnectionConfig(
+            protocol="http", transport=httpx.MockTransport(lambda _: response)
+        ),
+        _endpoint(),
+    )
+    pending = None
+    try:
+        download = await adapter.read_bytes_stream_detailed("/data.bin", chunk_size=1)
+        assert await anext(download.body) == b"a"
+        pending = asyncio.create_task(anext(download.body))
+        await asyncio.wait_for(reading.wait(), timeout=2)
+
+        await asyncio.wait_for(download.body.aclose(), timeout=2)
+        assert response.is_closed
+        assert source.closed
+
+        release.set()
+        await pending
+        await download.body.aclose()
+        with pytest.raises(StopAsyncIteration):
+            await anext(download.body)
+    finally:
+        release.set()
+        if pending is not None:
+            await pending
+        await response.aclose()
+        await adapter._httpx_client.aclose()
+
+
 def test_sync_detailed_and_legacy_reads_preserve_behavior() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -186,6 +213,7 @@ def test_sync_detailed_and_legacy_reads_preserve_behavior() -> None:
     )
 
     detailed = adapter.read_bytes_detailed("/data.bin")
+    assert isinstance(adapter, DownloadFilesystemSync)
     assert detailed.body == b"hello"
     assert detailed.content_range == ByteRange(0, 4, 10, "bytes 0-4/10")
     assert adapter.read_bytes("/data.bin") == b"hello"
