@@ -48,7 +48,7 @@ This migration is purely structural for monorepo maintenance. Container image co
 
 ### Jupyter Authentication
 
-When `JUPYTER_TOKEN` is not explicitly configured, the `code-interpreter` entrypoint generates a per-sandbox random token on startup and writes its server metadata to an owner-only `/tmp/opensandbox-jupyter.*/jpserver-*.json` runtime file, which `execd` discovers automatically. An explicit nonempty `JUPYTER_TOKEN` remains supported and takes precedence. When pairing a new image with an older `execd` release that does not discover runtime tokens, supply an explicit `JUPYTER_TOKEN` at sandbox creation.
+When `JUPYTER_TOKEN` is not explicitly configured, the `code-interpreter` entrypoint generates a per-sandbox random token on startup and writes its server metadata to an owner-only (`0700`) `/tmp/opensandbox-jupyter.*/jpserver-*.json` runtime file, which `execd` discovers automatically after verifying directory permissions, owner UID, and kernel endpoint authentication. An explicit nonempty `JUPYTER_TOKEN` remains supported and takes precedence. When pairing a new image with an older `execd` release that does not discover runtime tokens, supply an explicit `JUPYTER_TOKEN` at sandbox creation.
 
 ### Signature and Provenance Verification
 

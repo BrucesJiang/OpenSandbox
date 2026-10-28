@@ -18,9 +18,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -29,6 +31,8 @@ import (
 	"github.com/alibaba/opensandbox/execd/pkg/jupyter/execute"
 	"github.com/alibaba/opensandbox/execd/pkg/log"
 )
+
+const maxJupyterRuntimeFileSize = 64 * 1024
 
 var errJupyterNotConfigured = errors.New("language runtime server not configured, please check your image runtime")
 
@@ -44,7 +48,7 @@ func (c *Controller) runJupyter(ctx context.Context, request *ExecuteCodeRequest
 	}
 	if request.Context == "" {
 		if c.getDefaultLanguageSession(request.Language) == "" {
-			if err := c.createDefaultLanguageJupyterContext(request.Language); err != nil {
+			if err := c.createDefaultLanguageJupyterContext(ctx, request.Language); err != nil {
 				return err
 			}
 		}
@@ -184,19 +188,40 @@ func (c *Controller) searchKernel(client *jupyter.Client, language Language) (st
 }
 
 func (c *Controller) jupyterToken() string {
-	if c.token != "" {
-		return c.token
+	tokens := c.jupyterTokens()
+	if len(tokens) == 0 {
+		return ""
 	}
-	return c.discoverJupyterToken()
+	return tokens[0]
 }
 
-// discoverJupyterToken reads the token written by a standalone code-interpreter
-// entrypoint in /tmp/opensandbox-jupyter.*/jpserver-*.json when execd is
-// launched without bootstrap.sh (for example via fast-sandbox infraComponents).
-func (c *Controller) discoverJupyterToken() string {
+func (c *Controller) jupyterTokens() []string {
+	if c.token != "" {
+		return []string{c.token}
+	}
+	return c.discoverJupyterTokens()
+}
+
+func (c *Controller) expectedJupyterRuntimeUID() int {
+	if c.jupyterRuntimeUID != nil {
+		return *c.jupyterRuntimeUID
+	}
+	return os.Geteuid()
+}
+
+type discoveredJupyterToken struct {
+	token   string
+	modTime time.Time
+}
+
+// discoverJupyterTokens reads candidate tokens written by a standalone
+// code-interpreter entrypoint in /tmp/opensandbox-jupyter.*/jpserver-*.json
+// when execd is launched without bootstrap.sh (for example via fast-sandbox
+// infraComponents), ordered from newest to oldest.
+func (c *Controller) discoverJupyterTokens() []string {
 	targetPort := jupyterPortFromBaseURL(c.baseURL)
 	if targetPort <= 0 {
-		return ""
+		return nil
 	}
 	root := c.jupyterRuntimeRoot
 	if root == "" {
@@ -204,34 +229,65 @@ func (c *Controller) discoverJupyterToken() string {
 	}
 	matches, err := filepath.Glob(filepath.Join(root, "opensandbox-jupyter.*", "jpserver-*.json"))
 	if err != nil {
-		return ""
+		return nil
 	}
 
-	var (
-		bestToken   string
-		bestModTime time.Time
-	)
+	expectedUID := c.expectedJupyterRuntimeUID()
+	candidates := make([]discoveredJupyterToken, 0, len(matches))
 	for _, match := range matches {
-		token, modTime, ok := readJupyterRuntimeToken(match, targetPort)
+		token, modTime, ok := readJupyterRuntimeToken(match, targetPort, expectedUID)
 		if !ok {
 			continue
 		}
-		if bestToken == "" || modTime.After(bestModTime) {
-			bestToken = token
-			bestModTime = modTime
-		}
+		candidates = append(candidates, discoveredJupyterToken{
+			token:   token,
+			modTime: modTime,
+		})
 	}
-	return bestToken
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].modTime.After(candidates[j].modTime)
+	})
+
+	tokens := make([]string, 0, len(candidates))
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if _, exists := seen[candidate.token]; exists {
+			continue
+		}
+		seen[candidate.token] = struct{}{}
+		tokens = append(tokens, candidate.token)
+	}
+	return tokens
 }
 
-func readJupyterRuntimeToken(filePath string, targetPort int) (string, time.Time, bool) {
-	fileInfo, err := os.Lstat(filePath)
-	if err != nil || !fileInfo.Mode().IsRegular() {
+func readJupyterRuntimeToken(filePath string, targetPort int, expectedUID int) (string, time.Time, bool) {
+	dirInfo, err := os.Lstat(filepath.Dir(filePath))
+	if err != nil || !dirInfo.Mode().IsDir() || dirInfo.Mode().Perm()&0o077 != 0 {
+		return "", time.Time{}, false
+	}
+	if uid, ok := runtimeFileOwnerUID(dirInfo); ok && uid != expectedUID {
 		return "", time.Time{}, false
 	}
 
-	data, err := os.ReadFile(filePath)
+	file, err := openRuntimeFileNoFollow(filePath)
 	if err != nil {
+		return "", time.Time{}, false
+	}
+	defer file.Close()
+
+	fileInfo, err := file.Stat()
+	if err != nil || !fileInfo.Mode().IsRegular() || fileInfo.Mode().Perm()&0o022 != 0 {
+		return "", time.Time{}, false
+	}
+	if fileInfo.Size() <= 0 || fileInfo.Size() > maxJupyterRuntimeFileSize {
+		return "", time.Time{}, false
+	}
+	if uid, ok := runtimeFileOwnerUID(fileInfo); ok && uid != expectedUID {
+		return "", time.Time{}, false
+	}
+
+	data, err := io.ReadAll(io.LimitReader(file, maxJupyterRuntimeFileSize+1))
+	if err != nil || int64(len(data)) > maxJupyterRuntimeFileSize {
 		return "", time.Time{}, false
 	}
 
