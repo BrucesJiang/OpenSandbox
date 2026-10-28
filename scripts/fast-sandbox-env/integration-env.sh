@@ -397,7 +397,23 @@ failure_dump() {
 				echo "-- /dev/ublk*:"
 				ls -la /dev/ublk* 2>&1
 				echo "-- /proc/devices (ublk):"
-				grep -i ublk /proc/devices 2>&1' 2>&1 || true
+				grep -i ublk /proc/devices 2>&1
+				echo "-- ublkd attached devices, attributed by owner (the daemon list is the only record that outlives a dead builder/fastlet pod):"
+				list=$(curl -sS -m 10 --noproxy "*" --unix-socket /run/fast-sandbox/overlaybd/ublkd.sock http://ublkd/v1/list 2>&1)
+				printf "%s\n" "$list" | tr "{," "\n" | grep -o "\"config\":\"[^\"]*\"" | sed "s/^\"config\":\"//;s/\"\$//" | sort > /tmp/fsb-dev-configs.$$
+				builder=0; shared=0; sandbox=0; other=0
+				while read -r cfg; do
+					[ -n "$cfg" ] || continue
+					case "$cfg" in
+					/build/*) builder=$((builder+1)); tag=builder ;;
+					*.snapfiles/*) shared=$((shared+1)); tag=fastlet-shared ;;
+					*/sandboxes/*) sandbox=$((sandbox+1)); tag=fastlet-sandbox ;;
+					*) other=$((other+1)); tag=other ;;
+					esac
+					echo "    [$tag] $cfg"
+				done < /tmp/fsb-dev-configs.$$
+				echo "   summary: builder=$builder fastlet-shared=$shared fastlet-sandbox=$sandbox other=$other"
+				rm -f /tmp/fsb-dev-configs.$$' 2>&1 || true
 		done
 		echo "--- fastlet pod logs, every container (deep tail) ---"
 		kubectl logs -n "$RESOURCE_NS" -l app=sandbox-fastlet \
