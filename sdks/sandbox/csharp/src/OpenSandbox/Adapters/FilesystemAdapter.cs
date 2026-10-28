@@ -219,7 +219,7 @@ internal sealed class FilesystemAdapter : IIdentitySandboxFiles
         using var response = await _client.SendWithWakeRetryAsync(
             () => BuildDownloadRequest(path, options), cancellationToken, _client.SendTransferAsync).ConfigureAwait(false);
         await _client.EnsureSuccessAsync(response, cancellationToken).ConfigureAwait(false);
-        var body = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+        var body = await HttpClientWrapper.ReadContentBytesAsync(response.Content, cancellationToken).ConfigureAwait(false);
         return CreateReadBytesResponse(response, body, options);
     }
 

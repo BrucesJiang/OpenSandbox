@@ -24,7 +24,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from io import IOBase, TextIOBase
 from typing import TypedDict
 
@@ -244,17 +244,24 @@ class FilesystemAdapter(Filesystem):
         range_header: str | None = None,
         offset: int | None = None,
         limit: int | None = None,
-    ) -> AsyncIterator[bytes]:
+    ) -> AsyncGenerator[bytes, None]:
         """Stream file content as byte chunks."""
-        return (
-            await self.read_bytes_stream_detailed(
-                path,
-                chunk_size=chunk_size,
-                range_header=range_header,
-                offset=offset,
-                limit=limit,
-            )
-        ).body
+        response = await self.read_bytes_stream_detailed(
+            path,
+            chunk_size=chunk_size,
+            range_header=range_header,
+            offset=offset,
+            limit=limit,
+        )
+
+        async def _iter() -> AsyncGenerator[bytes, None]:
+            try:
+                async for chunk in response.body:
+                    yield chunk
+            finally:
+                await response.body.aclose()
+
+        return _iter()
 
     async def read_bytes_stream_detailed(
         self,
@@ -299,7 +306,7 @@ class FilesystemAdapter(Filesystem):
                 )
             return create_read_bytes_response(
                 response,
-            iter_async_response_bytes(response, chunk_size),
+                iter_async_response_bytes(response, chunk_size),
                 line_based=offset is not None or limit is not None,
             )
         except Exception as e:

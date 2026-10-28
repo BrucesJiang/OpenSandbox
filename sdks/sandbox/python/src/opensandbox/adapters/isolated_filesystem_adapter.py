@@ -21,7 +21,7 @@ Uses auto-generated isolated_execution API modules with explicit session_id.
 
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from io import IOBase, TextIOBase
 from uuid import UUID
 
@@ -175,16 +175,23 @@ class IsolatedFilesystemAdapter(Filesystem):
         range_header: str | None = None,
         offset: int | None = None,
         limit: int | None = None,
-    ) -> AsyncIterator[bytes]:
-        return (
-            await self.read_bytes_stream_detailed(
-                path,
-                chunk_size=chunk_size,
-                range_header=range_header,
-                offset=offset,
-                limit=limit,
-            )
-        ).body
+    ) -> AsyncGenerator[bytes, None]:
+        response = await self.read_bytes_stream_detailed(
+            path,
+            chunk_size=chunk_size,
+            range_header=range_header,
+            offset=offset,
+            limit=limit,
+        )
+
+        async def _iter() -> AsyncGenerator[bytes, None]:
+            try:
+                async for chunk in response.body:
+                    yield chunk
+            finally:
+                await response.body.aclose()
+
+        return _iter()
 
     async def read_bytes_stream_detailed(
         self,

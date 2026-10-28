@@ -136,6 +136,24 @@ public class FilesystemAdapterTests
     }
 
     [Fact]
+    public async Task ReadFileAsync_ShouldCancelAfterHeaders()
+    {
+        using var content = new StallingContent();
+        var handler = new DownloadHandler();
+        handler.Enqueue(new HttpResponseMessage(HttpStatusCode.OK) { Content = content });
+        using var client = new HttpClient(handler);
+        using var cancellation = new CancellationTokenSource();
+        var adapter = CreateAdapter(client);
+
+        var read = adapter.ReadFileAsync("/data.txt", cancellationToken: cancellation.Token);
+        await content.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        cancellation.Cancel();
+
+        var action = async () => await read.WaitAsync(TimeSpan.FromSeconds(5));
+        await action.Should().ThrowAsync<OperationCanceledException>();
+    }
+
+    [Fact]
     public async Task ListDirectoryAsync_ShouldParseEntryTypeAndSendDepthZero()
     {
         var payload = """
@@ -330,7 +348,7 @@ public class FilesystemAdapterTests
     private static FilesystemAdapter CreateAdapter(HttpClient client)
     {
         var wrapper = new HttpClientWrapper(client, "http://localhost:8080");
-        return new FilesystemAdapter(wrapper, client, "http://localhost:8080", new Dictionary<string, string>());
+        return new FilesystemAdapter(wrapper, "http://localhost:8080", new Dictionary<string, string>());
     }
 
     private static HttpResponseMessage DownloadResponse(
@@ -407,6 +425,33 @@ public class FilesystemAdapterTests
         protected override void Dispose(bool disposing)
         {
             Disposed = true;
+            base.Dispose(disposing);
+        }
+    }
+
+    private sealed class StallingContent : HttpContent
+    {
+        public TaskCompletionSource<bool> Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<bool> _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
+            SerializeToStreamAsync(stream, context, CancellationToken.None);
+
+        protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken cancellationToken)
+        {
+            Started.TrySetResult(true);
+            await _release.Task.WaitAsync(cancellationToken);
+        }
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            _release.TrySetResult(true);
             base.Dispose(disposing);
         }
     }
