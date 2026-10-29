@@ -202,6 +202,13 @@ jobs:
           chmod +x components/execd/tests/init_container.sh
           bash components/execd/tests/init_container.sh
 
+      - name: Mount tracefs
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          # The ubuntu-24.04 runner image 20261025.353.x stopped mounting
+          # tracefs by default; execd-ebpf-smoke.sh prechecks for it.
+          sudo mount -t tracefs tracefs /sys/kernel/tracing
+
       - name: Execd eBPF bare-container smoke
         if: matrix.os != 'windows-latest'
         shell: bash
