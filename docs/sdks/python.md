@@ -428,6 +428,19 @@ async with aclosing(await sandbox.files.read_bytes_stream("/tmp/large.bin")) as 
             break
 ```
 
+Use `read_bytes_detailed` or `read_bytes_stream_detailed` for the body together with HTTP status and range metadata; unknown sizes use `-1`. Check the optional `DownloadFilesystem` capability before calling them:
+
+```python
+from opensandbox.services import DownloadFilesystem
+
+files = sandbox.files
+if isinstance(files, DownloadFilesystem):
+    download = await files.read_bytes_detailed("/tmp/data.bin", range_header="bytes=5-")
+    print(download.is_partial, download.total_size, download.content_range)
+```
+
+Check `is_partial` before appending a resumed download. Use `async with download.body` for a detailed stream so it closes even on early exit. The synchronous equivalent uses `DownloadFilesystemSync` from `opensandbox.sync.services` and `with download.body`.
+
 #### File operations with an explicit identity
 
 Bind a filesystem client to a Linux UID and GID:
