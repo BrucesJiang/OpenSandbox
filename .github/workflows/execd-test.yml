@@ -205,9 +205,12 @@ jobs:
       - name: Mount tracefs
         if: matrix.os == 'ubuntu-latest'
         run: |
-          # The ubuntu-24.04 runner image 20261025.353.x stopped mounting
-          # tracefs by default; execd-ebpf-smoke.sh prechecks for it.
-          sudo mount -t tracefs tracefs /sys/kernel/tracing
+          # The ubuntu-24.04 runner image 20261025.353.x mounts tracefs
+          # inconsistently across runner VMs; execd-ebpf-smoke.sh prechecks
+          # for it. Mount only when it is not already there (idempotent).
+          if [ ! -e /sys/kernel/tracing/events ]; then
+            sudo mount -t tracefs tracefs /sys/kernel/tracing
+          fi
 
       - name: Execd eBPF bare-container smoke
         if: matrix.os != 'windows-latest'
