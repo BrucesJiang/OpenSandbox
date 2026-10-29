@@ -33,6 +33,7 @@ const (
 	jupyterIdlePollIntervalEnv = "EXECD_JUPYTER_IDLE_POLL_INTERVAL"
 	isolationConfigEnv         = "EXECD_ISOLATION_CONFIG"
 	runtimeInitEnv             = "EXECD_RUNTIME_INIT"
+	sseLegacyCompatEnv         = "EXECD_SSE_LEGACY_COMPAT"
 )
 
 // InitFlags registers CLI flags and env overrides.
@@ -113,7 +114,13 @@ func InitFlags() {
 	}
 	flag.BoolVar(&RuntimeInit, "runtime-init", RuntimeInit, "Gate preStart and the entrypoint on POST /internal/init; until then only /ping, /ready, and /internal/init are served")
 
-	flag.BoolVar(&SseLegacyCompat, "sse-legacy-compat", SseLegacyCompat, "Omit exit_code from execution_complete and error SSE events for SDKs whose EventNode schema predates the field")
+	if sseLegacyCompatFromEnv := os.Getenv(sseLegacyCompatEnv); sseLegacyCompatFromEnv != "" {
+		enabled, err := strconv.ParseBool(sseLegacyCompatFromEnv)
+		if err != nil {
+			stdlog.Panicf("Invalid %s=%s: must be a boolean value", sseLegacyCompatEnv, sseLegacyCompatFromEnv)
+		}
+		SseLegacyCompat = enabled
+	}
 
 	// Parse flags - these will override environment variables if provided
 	flag.Parse()
