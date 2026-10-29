@@ -368,4 +368,3 @@ func TestCreateContext_SkipsNewerUnauthenticatedDecoyRuntimeFile(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "sess-after-decoy", sessionID)
 }
-
