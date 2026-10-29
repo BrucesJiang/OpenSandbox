@@ -25,6 +25,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"hash/crc32"
 	"net/http"
 	"net/netip"
 	"strings"
@@ -135,25 +136,44 @@ type fastSandboxPolicyServer struct {
 	// makes the Fastlet invalidate Binding readiness and replay SET_BINDING
 	// followed by the reached Hooks (restart recovery).
 	instanceID string
+	// actionsAPIVersion is one protocol for the whole shared Fastlet domain.
+	// V2 is explicit and default-off; in that mode v1 action and relay routes
+	// are not mounted, so older senders fail closed.
+	actionsAPIVersion string
+	actionOwners      map[subject.Subject]actionhandler.Owner
+	actionOwnerLocks  [256]sync.RWMutex
 }
 
 func newFastSandboxPolicyServer(ctx context.Context, reg *subject.MemoryRegistry, nft fastSandboxNftApplier) *fastSandboxPolicyServer {
 	return &fastSandboxPolicyServer{
-		ctx:              ctx,
-		reg:              reg,
-		nft:              nft,
-		actionGate:       make(chan struct{}, 1),
-		rebinds:          make(map[subject.Subject]*subjectRebind),
-		vaults:           make(map[subject.Subject]vaultEntry),
-		pendingPolicies:  make(map[subject.Subject]*policy.NetworkPolicy),
-		policies:         make(map[subject.Subject]*policyEntry),
-		subjAtt:          make(map[subject.Subject]actionhandler.NetworkAttachment),
-		subjFence:        make(map[subject.Subject]subject.Fencing),
-		gatewayDNSRefs:   make(map[subject.Subject]netip.Addr),
-		dnsRedirectApply: iptables.ReplaceGatewayDNSRedirects,
-		mitmEntries:      make(map[subject.Subject]iptables.MitmRedirectEntry),
-		instanceID:       newHandlerInstanceID(),
+		ctx:               ctx,
+		reg:               reg,
+		nft:               nft,
+		actionGate:        make(chan struct{}, 1),
+		rebinds:           make(map[subject.Subject]*subjectRebind),
+		vaults:            make(map[subject.Subject]vaultEntry),
+		pendingPolicies:   make(map[subject.Subject]*policy.NetworkPolicy),
+		policies:          make(map[subject.Subject]*policyEntry),
+		subjAtt:           make(map[subject.Subject]actionhandler.NetworkAttachment),
+		subjFence:         make(map[subject.Subject]subject.Fencing),
+		gatewayDNSRefs:    make(map[subject.Subject]netip.Addr),
+		dnsRedirectApply:  iptables.ReplaceGatewayDNSRedirects,
+		mitmEntries:       make(map[subject.Subject]iptables.MitmRedirectEntry),
+		instanceID:        newHandlerInstanceID(),
+		actionsAPIVersion: constants.ActionsAPIVersion,
+		actionOwners:      make(map[subject.Subject]actionhandler.Owner),
 	}
+}
+
+func (s *fastSandboxPolicyServer) SetActionsAPIVersion(version string) {
+	s.actionsAPIVersion = version
+}
+
+func (s *fastSandboxPolicyServer) ownerLock(subj subject.Subject) *sync.RWMutex {
+	// Subject names are caller-provided identifiers. A bounded stripe set
+	// prevents requests for arbitrary subjects from growing a lock map forever;
+	// hash collisions only serialize otherwise independent subjects.
+	return &s.actionOwnerLocks[crc32.ChecksumIEEE([]byte(subj))%uint32(len(s.actionOwnerLocks))]
 }
 
 // SetMitm wires the shared mitmproxy into the control plane: the healthz gate
@@ -259,10 +279,18 @@ func cloneGatewayDNSRefs(refs map[subject.Subject]netip.Addr) map[subject.Subjec
 // the healthz probe. No proxy-route surface.
 func (s *fastSandboxPolicyServer) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc(constants.ActionsStatusPath, s.handleActionsStatus)
-	mux.HandleFunc(constants.ActionsDispatchPath, s.handleActions)
-	mux.HandleFunc(constants.VaultRelayPathPrefix, s.handleVaultRelay)
-	mux.HandleFunc(constants.PolicyRelayPathPrefix, s.handlePolicyRelay)
+	if s.actionsAPIVersion == constants.ActionsAPIVersionV2 {
+		mux.HandleFunc(constants.ActionsV2StatusPath, s.handleActionsV2Status)
+		mux.HandleFunc(constants.ActionsV2DispatchPath, s.handleActionsV2)
+		mux.HandleFunc(constants.ActionsV2OwnerPathPrefix, s.handleActionsV2Owner)
+		mux.HandleFunc(constants.ActionsV2VaultRelayPathPrefix, s.handleVaultRelay)
+		mux.HandleFunc(constants.ActionsV2PolicyRelayPathPrefix, s.handlePolicyRelay)
+	} else {
+		mux.HandleFunc(constants.ActionsStatusPath, s.handleActionsStatus)
+		mux.HandleFunc(constants.ActionsDispatchPath, s.handleActions)
+		mux.HandleFunc(constants.VaultRelayPathPrefix, s.handleVaultRelay)
+		mux.HandleFunc(constants.PolicyRelayPathPrefix, s.handlePolicyRelay)
+	}
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	return mux
 }
