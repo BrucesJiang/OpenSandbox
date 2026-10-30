@@ -25,6 +25,8 @@ A `SandboxTemplate` describes a conversion, not just a copy: an ordinary OCI ima
 - **Runtime shape is declared**: the template names the Firecracker guest kernel and reference machine; readiness defines when the guest counts as up.
 - **Output is content-addressed**: the build publishes artifacts to the store and records a manifest reference plus artifact digest in the CR status — builds are immutable and verifiable, never mutated in place.
 
+Native templates publish to S3-compatible storage and resolve through the per-template image index. OverlayBD templates publish paired rootfs and snapshot images to an OCI registry; the catalog records the immutable OCI manifest reference, which becomes the runtime image at sandbox creation. Build credentials are selected by destination through server configuration. See [OCI template setup](/guides/oci-templates) for deployment and usage.
+
 ## Using templates
 
 Sandbox creation with a `templateId` resolves to the recorded artifact; capacity comes from the referenced pool, not from the template. Because the template pins the workload, per-sandbox behavior is limited to intent: identity, TTL, metadata, network policy, and an optional pool reference (see [Scheduling](/architecture/fast-sandbox/scheduling)). Updating a template rebuilds the artifact and yields a new digest — existing sandboxes keep running their admitted revision; new creations pick up the new build.

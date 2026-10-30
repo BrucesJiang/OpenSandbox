@@ -1089,7 +1089,8 @@ def _make_template_info(phase: str = "Pending") -> TemplateInfo:
 
 
 class TestTemplateCommands:
-    def test_create_builds_request(self, runner: CliRunner) -> None:
+    @pytest.mark.parametrize("publish", ["s3://bucket/publish", "oci://registry.example.com/team/templates"])
+    def test_create_builds_request(self, runner: CliRunner, publish: str) -> None:
         mock_mgr = MagicMock()
         mock_mgr.create_template.return_value = _make_template_info()
 
@@ -1101,7 +1102,9 @@ class TestTemplateCommands:
                 "--image",
                 "python:3.12",
                 "--publish",
-                "s3://bucket/publish",
+                publish,
+                "--format",
+                "overlaybd" if publish.startswith("oci://") else "native",
                 "--resource",
                 "cpu=1",
                 "--entrypoint",
@@ -1122,7 +1125,8 @@ class TestTemplateCommands:
         req = mock_mgr.create_template.call_args.args[0]
         assert isinstance(req, CreateTemplateRequest)
         assert req.image == "python:3.12"
-        assert req.publish == "s3://bucket/publish"
+        assert req.publish == publish
+        assert req.format == ("overlaybd" if publish.startswith("oci://") else "native")
         assert req.resource_limits == {"cpu": "1"}
         assert req.entrypoint == ["python"]
         assert req.env == {"FOO": "bar"}
@@ -1132,15 +1136,17 @@ class TestTemplateCommands:
         data = json.loads(result.output)
         assert data["template_id"] == "tpl_abc"
 
+    @pytest.mark.parametrize("publish", ["s3://bucket/publish", "oci://registry.example.com/team/templates"])
     def test_create_from_file_builds_request(
-        self, runner: CliRunner, tmp_path: Path
+        self, runner: CliRunner, tmp_path: Path, publish: str
     ) -> None:
         mock_mgr = MagicMock()
         mock_mgr.create_template.return_value = _make_template_info()
         request_path = tmp_path / "template-request.json"
         request_path.write_text(json.dumps({
             "image": "python:3.12",
-            "publish": "s3://bucket/publish",
+            "publish": publish,
+            "format": "overlaybd" if publish.startswith("oci://") else "native",
             "resourceLimits": {"cpu": "1", "memory": "512Mi"},
             "entrypoint": ["python", "-m", "http.server"],
             "env": {"FOO": "bar"},
@@ -1158,7 +1164,8 @@ class TestTemplateCommands:
         req = mock_mgr.create_template.call_args.args[0]
         assert isinstance(req, CreateTemplateRequest)
         assert req.image == "python:3.12"
-        assert req.publish == "s3://bucket/publish"
+        assert req.publish == publish
+        assert req.format == ("overlaybd" if publish.startswith("oci://") else "native")
         assert req.resource_limits == {"cpu": "1", "memory": "512Mi"}
         assert req.entrypoint == ["python", "-m", "http.server"]
         assert req.env == {"FOO": "bar"}

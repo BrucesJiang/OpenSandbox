@@ -127,6 +127,12 @@ def _publish_validation_error(format: str, publish: str) -> Optional[str]:
                 "publish must be 'oci://registry/repository' without a "
                 "trailing slash."
             )
+        path_component = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+        if (
+            not re.fullmatch(r"(?:[a-zA-Z0-9.-]+|\[[0-9a-fA-F:]+\])(?::[0-9]+)?", host)
+            or not re.fullmatch(rf"{path_component}(?:/{path_component})*", repository)
+        ):
+            return "publish must be a valid oci://registry/repository without a tag or digest."
         return None
     if format == "native":
         if not publish.startswith("s3://"):
@@ -453,7 +459,7 @@ class FastSandboxTemplateService:
         if str(record.spec.get("format") or "overlaybd") != "overlaybd":
             return record.template_id, entrypoint
         manifest_ref = record.manifest_ref or ""
-        if not manifest_ref.startswith("oci://"):
+        if not re.fullmatch(re.escape(record.publish) + r"@sha256:[0-9a-f]{64}", manifest_ref):
             # Transient (status not landed) or a legacy overlaybd+S3 row
             # (rejected upstream). Both 404; the legacy message is
             # actionable for the owner.
@@ -463,7 +469,7 @@ class FastSandboxTemplateService:
                     "code": SandboxErrorCodes.FSB_TEMPLATE_NOT_FOUND,
                     "message": (
                         "Template artifact is not runnable: overlaybd "
-                        "templates require an OCI manifestRef from a build "
+                        "templates require an immutable OCI manifestRef in the publish repository from a build "
                         "against the current fast-sandbox contract; rebuild "
                         "the template."
                     ),
@@ -491,12 +497,13 @@ class FastSandboxTemplateService:
         fmt = str(record.spec.get("format") or "overlaybd")
         spec: dict = {
             "image": record.source_image,
-            # Per-template artifact identity: the builder publishes the image
+            # Native artifact identity: the builder publishes the image
             # index under BOTH this key (exact, immutable per template) and
             # the legacy sha256(source-image) key (last-writer-wins, kept for
             # warmImages and older clients). Sandbox creates carry the
             # template key, so two templates of the same source image resolve
-            # to their own artifact sets and caches.
+            # to their own artifact sets and caches. OCI creates instead use
+            # the immutable manifestRef recorded after publication.
             "indexKey": record.template_id,
             "entrypoint": list(record.spec.get("entrypoint") or DEFAULT_ENTRYPOINT),
             "execd": self._execd_image,

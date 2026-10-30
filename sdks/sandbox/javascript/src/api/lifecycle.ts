@@ -2287,8 +2287,10 @@ export interface components {
             };
             readiness?: components["schemas"]["FsbTemplateReadiness"];
             /**
-             * @description S3-compatible publish target for the built artifacts,
-             *     e.g. `s3://bucket/publish`.
+             * @description Publish destination: `s3://bucket/publish` for native artifacts or
+             *     `oci://registry/repository` for overlaybd artifacts. OCI targets
+             *     must not contain a tag or digest; the builder generates unique
+             *     tags per build. Registry credentials are configured on the server.
              */
             publish: string;
             /**
@@ -2306,8 +2308,8 @@ export interface components {
              */
             phase: "Pending" | "Building" | "Succeeded" | "Failed";
             /**
-             * @description S3 manifest reference of the published artifacts; present when
-             *     Succeeded.
+             * @description Published S3 manifest reference or immutable OCI reference
+             *     (`oci://registry/repository@sha256:...`); present when Succeeded.
              */
             manifestRef?: string;
             /** @description Failure reason when phase is Failed. */
@@ -2334,7 +2336,7 @@ export interface components {
                 [key: string]: string;
             };
             readiness?: components["schemas"]["FsbTemplateReadiness"];
-            /** @description S3-compatible publish target. */
+            /** @description S3-compatible or repository-only OCI publish target. */
             publish: string;
             /**
              * @description Snapshot storage encoding.
