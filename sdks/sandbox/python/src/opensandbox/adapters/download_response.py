@@ -135,6 +135,12 @@ class _ResponseByteStream:
         self._closed = True
         self._response.close()
 
+    def __del__(self) -> None:
+        # The sync read_bytes_stream hands this out as a plain iterator, so a
+        # caller that stops early may drop it without calling close().
+        if not getattr(self, "_closed", True):
+            self.close()
+
     def __enter__(self) -> "_ResponseByteStream":
         return self
 
