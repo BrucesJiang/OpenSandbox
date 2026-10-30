@@ -15,6 +15,7 @@
 #
 
 import asyncio
+import gc
 
 import httpx
 import pytest
@@ -26,6 +27,9 @@ from opensandbox.models import ByteRange
 from opensandbox.models.sandboxes import SandboxEndpoint
 from opensandbox.services import DownloadFilesystem
 from opensandbox.sync.adapters.filesystem_adapter import FilesystemAdapterSync
+from opensandbox.sync.adapters.isolated_filesystem_adapter import (
+    IsolatedFilesystemAdapterSync,
+)
 from opensandbox.sync.services import DownloadFilesystemSync
 
 
@@ -254,6 +258,35 @@ def test_sync_detailed_streams_close_unconsumed_and_partial_responses() -> None:
         for _chunk in partial.body:
             break
     assert streams[1].closed is True
+    adapter._httpx_client.close()
+
+
+@pytest.mark.parametrize("isolated", [False, True])
+def test_sync_legacy_stream_closes_response_when_abandoned(isolated: bool) -> None:
+    streams: list[_TrackingSyncStream] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        stream = _TrackingSyncStream()
+        streams.append(stream)
+        return httpx.Response(200, request=request, stream=stream)
+
+    config = ConnectionConfigSync(protocol="http", transport=httpx.MockTransport(handler))
+    if isolated:
+        adapter = IsolatedFilesystemAdapterSync(
+            config, _endpoint(), "12345678-1234-5678-1234-567812345678"
+        )
+    else:
+        adapter = FilesystemAdapterSync(config, _endpoint())
+
+    # The legacy API returns a plain iterator, so callers that stop early
+    # never call close(); dropping the iterator has to release the response.
+    chunks = adapter.read_bytes_stream("/data.bin", chunk_size=2)
+    for _chunk in chunks:
+        break
+    assert streams[0].closed is False
+    del chunks
+    gc.collect()
+    assert streams[0].closed is True
     adapter._httpx_client.close()
 
 
