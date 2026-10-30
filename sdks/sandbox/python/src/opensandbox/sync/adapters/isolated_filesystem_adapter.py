@@ -174,22 +174,13 @@ class IsolatedFilesystemAdapterSync(FilesystemSync):
         offset: int | None = None,
         limit: int | None = None,
     ) -> Iterator[bytes]:
-        body = self.read_bytes_stream_detailed(
+        return self.read_bytes_stream_detailed(
             path,
             chunk_size=chunk_size,
             range_header=range_header,
             offset=offset,
             limit=limit,
         ).body
-
-        # A generator closes the response when the caller drops it early.
-        def _iter() -> Iterator[bytes]:
-            try:
-                yield from body
-            finally:
-                body.close()
-
-        return _iter()
 
     def read_bytes_stream_detailed(
         self,

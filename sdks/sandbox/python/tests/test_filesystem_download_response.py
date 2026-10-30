@@ -287,6 +287,17 @@ def test_sync_legacy_stream_closes_response_when_abandoned(isolated: bool) -> No
     del chunks
     gc.collect()
     assert streams[0].closed is True
+
+    # The same holds when nothing was read.
+    unread = adapter.read_bytes_stream("/data.bin")
+    del unread
+    gc.collect()
+    assert streams[1].closed is True
+
+    # close() before the first chunk releases it too.
+    closed = adapter.read_bytes_stream("/data.bin")
+    closed.close()  # type: ignore[attr-defined]
+    assert streams[2].closed is True
     adapter._httpx_client.close()
 
 
