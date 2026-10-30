@@ -552,7 +552,7 @@ type TemplateReadiness struct {
 // TemplateStatus is the build status of a fsb template.
 type TemplateStatus struct {
 	Phase TemplatePhase `json:"phase"`
-	// ManifestRef is the S3 manifest reference of the published artifacts;
+	// ManifestRef is the published S3 manifest reference or immutable OCI reference;
 	// present when the phase is Succeeded.
 	ManifestRef string `json:"manifestRef,omitempty"`
 	// Message is the failure reason when the phase is Failed.
@@ -569,8 +569,8 @@ type TemplateStatus struct {
 type CreateTemplateRequest struct {
 	// Image is the source OCI image reference the golden image is built from.
 	Image string `json:"image"`
-	// Publish is the S3-compatible publish target for the built artifacts,
-	// e.g. "s3://bucket/publish".
+	// Publish is s3://bucket/publish (native) or oci://registry/repository
+	// (overlaybd, without a tag or digest).
 	Publish string `json:"publish"`
 	// ResourceLimits is the guest machine sizing, e.g.
 	// {"cpu": "1", "memory": "512Mi", "disk": "2Gi"}. Server defaults when
