@@ -788,4 +788,4 @@ catch (SandboxException ex)
 
 ## License
 
-Apache License 2.0
+The C# SDK code is licensed under [Apache 2.0](https://github.com/opensandbox-group/OpenSandbox/blob/main/LICENSE).

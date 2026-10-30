@@ -825,4 +825,4 @@ if err != nil {
 
 ## License
 
-Apache 2.0
+The Go SDK code is licensed under [Apache 2.0](https://github.com/opensandbox-group/OpenSandbox/blob/main/LICENSE).
